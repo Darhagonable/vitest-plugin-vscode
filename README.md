@@ -180,6 +180,12 @@ sequenceDiagram
 
 Contributions welcome! Please open an issue first to discuss what you'd like to change.
 
+### Contributors
+
+<a href="https://github.com/Darhagonable/vitest-plugin-vscode/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Darhagonable/vitest-plugin-vscode" alt="Contributors" />
+</a>
+
 ## License
 
 MIT
