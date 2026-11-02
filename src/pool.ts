@@ -12,10 +12,10 @@ import {
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
 import type { PoolOptions, PoolWorker } from 'vitest/node';
-import type { VSCodeExtensionHostPluginOptions } from './plugin';
+import type { VSCodeOptions } from './plugin';
 
 export class VSCodePoolWorker implements PoolWorker {
-  readonly name = 'vscodeRunner';
+  readonly name = 'vscodePool';
 
   private readonly events = new EventEmitter();
   private server: net.Server | undefined;
@@ -26,7 +26,7 @@ export class VSCodePoolWorker implements PoolWorker {
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeExtensionHostPluginOptions
+    private readonly options: VSCodeOptions
   ) {}
 
   on(event: string, callback: (arg: unknown) => void): void {

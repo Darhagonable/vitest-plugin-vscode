@@ -1,10 +1,10 @@
 {
-  "name": "vitest-vscode-runner",
+  "name": "vitest-plugin-vscode",
   "version": "0.0.9",
   "license": "MIT",
   "private": false,
   "type": "module",
-  "description": "Vitest plugin for running VS Code extension tests inside the extension host.",
+  "description": "Vitest plugin that runs VS Code extension tests inside a real extension host.",
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
   "exports": {

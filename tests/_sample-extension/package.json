@@ -9,6 +9,6 @@
   },
   "type": "module",
   "devDependencies": {
-    "vitest-vscode-runner": "workspace:*"
+    "vitest-plugin-vscode": "workspace:*"
   }
 }

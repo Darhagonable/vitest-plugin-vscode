@@ -5,7 +5,7 @@ import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/ou
 import { VSCodePoolWorker } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
-export interface VSCodeExtensionHostPluginOptions {
+export interface VSCodeOptions {
   /**
    * The VS Code version to download. Valid versions are:
    * - `'stable'`
@@ -80,18 +80,18 @@ export interface VSCodeExtensionHostPluginOptions {
   reuseWorker?: boolean;
 }
 
-export function vscodeRunner(options: VSCodeExtensionHostPluginOptions): Plugin {
+export function vscodePlugin(options: VSCodeOptions): Plugin {
   return {
-    name: 'vitest-vscode-extension-host',
+    name: 'vitest-plugin-vscode',
     config(config: ViteUserConfig) {
       if (config.test?.pool !== undefined) {
-        throw new Error('[vitest-vscode-extension-host] test.pool is managed by vscodeRunner().');
+        throw new Error('[vitest-plugin-vscode] test.pool is managed by vscodePlugin().');
       }
 
       config.test = {
         ...config.test,
         pool: {
-          name: 'vscodeRunner',
+          name: 'vscodePool',
           createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
         }
       };
@@ -118,7 +118,7 @@ export function vscodeRunner(options: VSCodeExtensionHostPluginOptions): Plugin 
 }
 
 export async function downloadVSCodeExecutable(
-  options: Pick<VSCodeExtensionHostPluginOptions, 'cachePath' | 'version' | 'platform' | 'timeout'>,
+  options: Pick<VSCodeOptions, 'cachePath' | 'version' | 'platform' | 'timeout'>,
 ): Promise<string> {
   return downloadAndUnzipVSCode({
     cachePath: options.cachePath,

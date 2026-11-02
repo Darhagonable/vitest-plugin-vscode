@@ -1,2 +1,2 @@
-export { downloadVSCodeExecutable, vscodeRunner } from './plugin';
-export type { VSCodeExtensionHostPluginOptions } from './plugin';
+export { vscodePlugin as default, downloadVSCodeExecutable } from './plugin';
+export type { VSCodeOptions } from './plugin';

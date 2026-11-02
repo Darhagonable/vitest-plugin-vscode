@@ -1,6 +1,6 @@
-# vitest-vscode-runner
+# vitest-plugin-vscode
 
-[![CI](https://github.com/Darhagonable/vitest-vscode-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/Darhagonable/vitest-vscode-runner/actions/workflows/ci.yml)
+[![CI](https://github.com/Darhagonable/vitest-plugin-vscode/actions/workflows/ci.yml/badge.svg)](https://github.com/Darhagonable/vitest-plugin-vscode/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Test your VS Code extensions with the real deal.** A Vitest plugin that runs your test suites inside an actual VS Code Extension Host—no mocks, no compromises.
@@ -23,11 +23,11 @@ Requires `vitest` 5 as a peer dependency. VS Code builds are downloaded per `pla
 ### Install
 
 ```bash
-npm install --save-dev vitest vitest-vscode-runner
+npm install -D vitest vitest-plugin-vscode
 # or
-yarn add -D vitest vitest-vscode-runner
+yarn add -D vitest vitest-plugin-vscode
 # or
-pnpm add -D vitest vitest-vscode-runner
+pnpm add -D vitest vitest-plugin-vscode
 ```
 
 ### Usage
@@ -35,13 +35,12 @@ pnpm add -D vitest vitest-vscode-runner
 ```ts
 // vitest.config.ts
 import { defineConfig } from 'vitest/config';
-import { vscodeRunner } from 'vitest-vscode-runner';
+import vscode from 'vitest-plugin-vscode';
 
 export default defineConfig({
   plugins: [
-    vscodeRunner({
+    vscode({
       version: 'insiders', // or 'stable' / specific VS Code version tag
-      reuseWorker: true,
     }),
   ],
   test: {
@@ -66,8 +65,6 @@ describe('hello command', () => {
 });
 ```
 
-By default every test file runs in its own VS Code instance — full isolation between files. Set vitest's `isolate: false` alongside `reuseWorker` to share instances across files.
-
 Debug like any vitest project: run with `--inspect-brk` and attach on the inspector port. Breakpoints hit in the extension host, not in the outer vitest process.
 
 ```bash
@@ -78,7 +75,7 @@ npm test
 
 ### Options
 
-`vscodeRunner` accepts these options; the VS Code-facing ones mirror [`TestOptions`](https://www.npmjs.com/package/@vscode/test-electron) and `DownloadOptions` from `@vscode/test-electron`:
+`vscode` vitest plugin accepts these options:
 
 | Option                     | Default      | Description                                                                                                                                                                                                 |
 | -------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -127,6 +124,8 @@ See the [CI workflow](.github/workflows/ci.yml) used by this repository for a co
 
 ## Development
 
+### Commands
+
 ```bash
 # Install dependencies
 pnpm install
@@ -144,9 +143,11 @@ pnpm test:sample-extension
 pnpm typecheck
 ```
 
+### Project structure
+
 | Path                                | Description                                                                                                   |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| **`src/plugin.ts`**                 | The vitest plugin: `vscodeRunner()` entry point, options, the `vscode` module shim, VS Code download pre-warm |
+| **`src/plugin.ts`**                 | The vitest plugin: `vscodePlugin()` entry point, options, the inline `vscode` shim, VS Code download pre-warm |
 | **`src/pool.ts`**                   | The custom pool: spawns VS Code per worker, owns the TCP server, speaks vitest's worker protocol              |
 | **`src/vscode-worker.ts`**          | The bridge: runs inside the extension host, connects back to the pool, executes the tests                     |
 | **`src/utils/ipc.ts`**              | Newline-delimited IPC over TCP, used by both sides                                                            |
@@ -154,6 +155,8 @@ pnpm typecheck
 | **`tests/e2e/integration.test.ts`** | E2E suite: boots a nested vitest on the sample extension and asserts on its results                           |
 | **`tests/unit/`**                   | Unit tests                                                                                                    |
 | **`tests/_sample-extension/`**       | Sample VS Code extension used as the fixture                                                                  |
+
+### Architecture
 
 ```mermaid
 sequenceDiagram

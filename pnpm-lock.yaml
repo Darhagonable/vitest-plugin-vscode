@@ -33,7 +33,7 @@ importers:
 
   tests/_sample-extension:
     devDependencies:
-      vitest-vscode-runner:
+      vitest-plugin-vscode:
         specifier: workspace:*
         version: link:../..
 
