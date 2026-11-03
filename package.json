@@ -5,13 +5,33 @@
   "private": false,
   "type": "module",
   "description": "Vitest plugin that runs VS Code extension tests inside a real extension host.",
-  "main": "./dist/index.mjs",
-  "types": "./dist/index.d.mts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Darhagonable/vitest-plugin-vscode.git"
+  },
+  "bugs": "https://github.com/Darhagonable/vitest-plugin-vscode/issues",
+  "homepage": "https://github.com/Darhagonable/vitest-plugin-vscode#readme",
+  "author": "Darhagonable",
+  "keywords": [
+    "vitest",
+    "vscode",
+    "vs-code",
+    "extension",
+    "extension-host",
+    "plugin",
+    "testing",
+    "integration-testing"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.mts",
       "import": "./dist/index.mjs"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist"
