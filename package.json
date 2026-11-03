@@ -1,6 +1,6 @@
 {
   "name": "vitest-plugin-vscode",
-  "version": "0.0.9",
+  "version": "0.0.0",
   "license": "MIT",
   "private": false,
   "type": "module",

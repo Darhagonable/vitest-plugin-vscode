@@ -176,6 +176,10 @@ sequenceDiagram
     Pool-->>Vitest: Test results
 ```
 
+### Releasing
+
+Create a GitHub Release with a tag like `v1.2.3` — that is the entire release ceremony. The tag is the single source of truth for the version: the publish workflow injects it into the package at publish time, so the `0.0.0` in `package.json` is a deliberate placeholder, not a mistake.
+
 ## Contributing
 
 Contributions welcome! Please open an issue first to discuss what you'd like to change.
