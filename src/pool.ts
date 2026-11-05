@@ -1,4 +1,4 @@
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
@@ -31,15 +31,15 @@ export class VSCodePoolWorker implements PoolWorker {
     private readonly options: VSCodeOptions
   ) {}
 
-  on(event: string, callback: (arg: unknown) => void): void {
+  on(event: string, callback: (arg: unknown) => void) {
     this.events.on(event, callback);
   }
 
-  off(event: string, callback: (arg: unknown) => void): void {
+  off(event: string, callback: (arg: unknown) => void) {
     this.events.off(event, callback);
   }
 
-  send(message: unknown): void {
+  send(message: unknown) {
     if (!this.ipc) {
       this.emitError(new Error('VS Code extension-host worker is not connected.'));
       return;
@@ -48,23 +48,39 @@ export class VSCodePoolWorker implements PoolWorker {
     this.ipc.send(message);
   }
 
-  deserialize(data: unknown): unknown {
+  deserialize(data: unknown) {
     return data;
   }
 
-  async start(): Promise<void> {
-    if (this.ipc) {
+  async start() {
+    if (this.ipc)
       return;
+
+    try {
+      await this.connect();
+    } catch (error) {
+      await this.dispose(true);
+      throw error;
     }
 
+    this.run?.catch((error) => {
+      if (!this.stopping)
+        this.emitError(error);
+    });
+  }
+
+  async stop() {
+    await this.dispose(false);
+  }
+
+  private async connect() {
     const { server, port, connected } = await this.createServer();
     this.server = server;
 
     // Anchor the download cache at the project root so nothing leaks outside
     // the package in monorepos. Per-worker profiles live in the OS temp dir:
     // short (unix socket path limits) and cleaned up on stop.
-    const root = this.poolOptions.project.config.root;
-    const cachePath = path.resolve(root, this.options.cachePath ?? '.vscode-test');
+    const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
 
     // Per-worker user-data and extensions dirs go in first: concurrent VS Code
@@ -82,14 +98,13 @@ export class VSCodePoolWorker implements PoolWorker {
       );
     }
 
-    const debugArg = this.createDebugLaunchArg();
-    if (debugArg) {
-      launchArgs.push(debugArg);
-    }
+    if (config.inspector.enabled)
+      launchArgs.push(config.inspector.waitForDebugger
+        ? `--inspect-brk-extensions=${config.inspector.port ?? 9229}`
+        : `--inspect-extensions=${config.inspector.port ?? 9229}`);
 
-    if (this.options.launchArgs) {
+    if (this.options.launchArgs)
       launchArgs.push(...this.options.launchArgs);
-    }
 
     // VS Code's Vitest extension runs test processes under Electron-as-Node.
     // The spawned VS Code must start as Electron, not inherit that mode.
@@ -99,8 +114,8 @@ export class VSCodePoolWorker implements PoolWorker {
     this.run = runTests({
       vscodeExecutablePath: this.options.vscodeExecutablePath,
       version: process.env.VSCODE_VERSION ?? this.options.version,
-      cachePath,
-      extensionDevelopmentPath: this.options.extensionDevelopmentPath ?? root,
+      cachePath: this.options.cachePath,
+      extensionDevelopmentPath: this.options.extensionDevelopmentPath ?? config.root,
       // Path to the bundled vscode worker for the extension host to import.
       extensionTestsPath: require.resolve('./vscode-worker.mjs'),
       reuseMachineInstall: this.options.reuseMachineInstall,
@@ -117,52 +132,42 @@ export class VSCodePoolWorker implements PoolWorker {
     });
     const exitedBeforeConnect = this.run.then(
       () => {
-        if (!bridgeConnected) {
+        if (!bridgeConnected)
           throw new Error('VS Code exited before the extension-host Vitest bridge connected.');
-        }
       },
-      error => {
-        if (!bridgeConnected) {
+      (error) => {
+        if (!bridgeConnected)
           throw error;
-        }
       }
     );
 
-    try {
-      await withTimeout(
-        Promise.race([
-          connectedBeforeExit,
-          exitedBeforeConnect
-        ]),
-        this.poolOptions.project.config.inspector.waitForDebugger ? 300_000 : 30_000,
-        'Timed out waiting for the VS Code extension-host Vitest bridge to connect.'
-      );
-    } catch (error) {
-      await this.cleanupAfterFailedStart();
-      throw error;
-    }
-
-    this.run.catch(error => {
-      if (!this.stopping) {
-        this.emitError(error);
-      }
-    });
+    await Promise.race([
+      connectedBeforeExit,
+      exitedBeforeConnect,
+      new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('Timed out waiting for the VS Code extension-host Vitest bridge to connect.'));
+        }, config.inspector.waitForDebugger ? 300_000 : 30_000).unref();
+      })
+    ]);
   }
 
-  async stop(): Promise<void> {
+  private async dispose(hard: boolean) {
     this.stopping = true;
-    this.ipc?.close();
-    this.server?.close();
 
     try {
-      if (this.run) {
+      if (hard) {
+        this.ipc?.destroy();
+      } else {
+        this.ipc?.close();
         // No timeout: vitest's own teardownTimeout bounds the whole pool.
-        await this.run;
+        await this.run?.then(undefined, (error) => {
+          if (!(error instanceof TestRunFailedError))
+            throw error;
+        });
       }
-    } catch (error) {
-      if (!(error instanceof TestRunFailedError)) {
-        throw error;
-      }
+
+      this.server?.close();
     } finally {
       this.ipc = undefined;
       this.server = undefined;
@@ -176,105 +181,42 @@ export class VSCodePoolWorker implements PoolWorker {
     }
   }
 
-  canReuse(): boolean {
+  canReuse() {
     return this.options.reuseWorker !== false;
-  }
-
-  private createDebugLaunchArg(): string | undefined {
-    const { enabled, port = 9229, waitForDebugger } = this.poolOptions.project.config.inspector;
-    if (!enabled) {
-      return undefined;
-    }
-
-    return waitForDebugger
-      ? `--inspect-brk-extensions=${port}`
-      : `--inspect-extensions=${port}`;
   }
 
   private async createServer() {
     const server = net.createServer();
-
-    await new Promise<void>((resolve, reject) => {
-      server.once('listening', () => resolve());
-      server.once('error', error => reject(new Error('Could not start the local TCP server for the VS Code Vitest worker.', { cause: error })));
-      server.listen(0, '127.0.0.1');
-    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
 
     const address = server.address();
 
     if (!address || typeof address === 'string') {
-      throw new Error('Could not allocate TCP port for VS Code Vitest worker.');
+      server.close();
+      throw new Error('Could not allocate IPC port for VS Code Vitest worker.');
     }
 
-    let resolveConnected: () => void = () => {};
-    let rejectConnected: (reason?: any) => void = () => {};
-    const connected = new Promise<void>((resolve, reject) => {
-      resolveConnected = resolve;
-      rejectConnected = reject;
-    });
-
-    server.on('error', rejectConnected);
-
-    server.on('connection', socket => {
+    server.on('connection', (socket) => {
       this.ipc = new LineIpc(socket);
-      this.ipc.on('message', message => {
-        this.events.emit('message', message);
-      });
-      this.ipc.on('error', error => {
-        this.emitError(error);
-      });
+      this.ipc.on('message', (message) => this.events.emit('message', message));
+      this.ipc.on('error', (error) => this.emitError(error));
       this.ipc.on('close', () => {
-        if (!this.stopping) {
+        if (!this.stopping)
           this.events.emit('exit');
-        }
       });
-      resolveConnected();
     });
 
     return {
       server,
       port: address.port,
-      connected
+      connected: once(server, 'connection')
     };
   }
 
-  private async cleanupAfterFailedStart() {
-    this.stopping = true;
-    this.ipc?.destroy();
-    this.server?.close();
-
-    if (this.profilePath) {
-      await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
-      this.profilePath = undefined;
-    }
-
-    this.ipc = undefined;
-    this.server = undefined;
-    this.run = undefined;
-    this.stopping = false;
-  }
-
-  private emitError(error: unknown): void {
+  private emitError(error: unknown) {
     if (this.events.listenerCount('error') > 0) {
       this.events.emit('error', error);
     }
   }
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
-  let timeout: NodeJS.Timeout | undefined;
-
-  const timeoutPromise = new Promise<void> ((_resolve, reject) => {
-    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
-    timeout.unref();
-  });
-
-  return Promise.race([
-    promise,
-    timeoutPromise
-  ]).finally(() => {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-  });
 }
