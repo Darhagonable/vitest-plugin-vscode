@@ -80,7 +80,7 @@ export interface VSCodeOptions {
   reuseWorker?: boolean;
 }
 
-export function vscodePlugin(options: VSCodeOptions): Plugin {
+export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
   return {
     name: 'vitest-plugin-vscode',
     config(config: ViteUserConfig) {
