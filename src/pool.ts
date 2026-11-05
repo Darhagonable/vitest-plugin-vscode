@@ -4,7 +4,7 @@ import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import {
   runTests,
   SilentReporter,
@@ -13,6 +13,8 @@ import {
 import { LineIpc } from './utils/ipc';
 import type { PoolOptions, PoolWorker } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
+
+const require = createRequire(import.meta.url);
 
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
@@ -100,7 +102,7 @@ export class VSCodePoolWorker implements PoolWorker {
       cachePath,
       extensionDevelopmentPath: this.options.extensionDevelopmentPath ?? root,
       // Path to the bundled vscode worker for the extension host to import.
-      extensionTestsPath: fileURLToPath(import.meta.resolve('./vscode-worker.mjs')),
+      extensionTestsPath: require.resolve('./vscode-worker.mjs'),
       reuseMachineInstall: this.options.reuseMachineInstall,
       extensionTestsEnv: {
         VITEST_RUNNER_IPC_HOST: '127.0.0.1',
