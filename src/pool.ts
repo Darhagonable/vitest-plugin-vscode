@@ -216,34 +216,19 @@ export class VSCodePoolWorker implements PoolWorker {
     server.on('error', rejectConnected);
 
     server.on('connection', socket => {
-      let bridgeReady = false;
       this.ipc = new LineIpc(socket);
       this.ipc.on('message', message => {
-        if (isBridgeReadyMessage(message)) {
-          bridgeReady = true;
-          resolveConnected();
-          return;
-        }
-
         this.events.emit('message', message);
       });
       this.ipc.on('error', error => {
-        if (bridgeReady) {
-          this.emitError(error);
-        } else {
-          rejectConnected(error);
-        }
+        this.emitError(error);
       });
       this.ipc.on('close', () => {
-        if (!bridgeReady) {
-          rejectConnected(new Error('VS Code extension-host Vitest bridge disconnected before it became ready.'));
-          return;
-        }
-
         if (!this.stopping) {
           this.events.emit('exit');
         }
       });
+      resolveConnected();
     });
 
     return {
@@ -274,12 +259,6 @@ export class VSCodePoolWorker implements PoolWorker {
       this.events.emit('error', error);
     }
   }
-}
-
-function isBridgeReadyMessage(message: unknown) {
-  return typeof message === 'object'
-    && message !== null
-    && (message as { __vscode_vitest_bridge_ready__?: boolean }).__vscode_vitest_bridge_ready__ === true;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {

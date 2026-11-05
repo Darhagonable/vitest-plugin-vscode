@@ -7,9 +7,10 @@ export class LineIpc extends EventEmitter {
   constructor(private readonly socket: Socket) {
     super();
 
-    socket.on('error', error => this.emit('error', error));
+    socket.on('connect', () => this.emit('connect'));
+    socket.on('error', (error) => this.emit('error', error));
     socket.on('close', () => this.emit('close'));
-    createInterface({ input: socket }).on('line', line => this.emit('message', parse(line)));
+    createInterface({ input: socket }).on('line', (line) => this.emit('message', parse(line)));
   }
 
   send(message: unknown): void {
