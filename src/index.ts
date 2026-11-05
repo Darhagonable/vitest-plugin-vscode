@@ -1,2 +1,2 @@
-export { vscodePlugin as default, downloadVSCodeExecutable } from './plugin';
+export { vscodePlugin as default } from './plugin';
 export type { VSCodeOptions } from './plugin';

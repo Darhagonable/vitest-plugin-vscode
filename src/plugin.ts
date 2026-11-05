@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import type { Plugin, ViteUserConfig } from 'vitest/config';
+import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
 import { VSCodePoolWorker } from './pool';
@@ -83,47 +83,28 @@ export interface VSCodeOptions {
 export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
   return {
     name: 'vitest-plugin-vscode',
-    config(config: ViteUserConfig) {
-      if (config.test?.pool !== undefined) {
+    config: (config) => {
+      if (config.test?.pool !== undefined)
         throw new Error('[vitest-plugin-vscode] test.pool is managed by vscodePlugin().');
-      }
 
-      config.test = {
-        ...config.test,
-        pool: {
-          name: 'vscodePool',
-          createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
-        }
+      config.test ??= {};
+      config.test.pool = {
+        name: 'vscodePool',
+        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
       };
     },
-    async configResolved(resolved) {
-      if (options.vscodeExecutablePath) {
-        return;
-      }
-
-      // Warm the download before any worker starts so a cold fetch cannot
-      // race the bridge startup timeout.
-      options.vscodeExecutablePath = await downloadVSCodeExecutable({
-        ...options,
-        cachePath: path.resolve(resolved.root, options.cachePath ?? '.vscode-test')
+    configResolved: async (resolved) => {
+      options.vscodeExecutablePath ??= await downloadAndUnzipVSCode({
+        cachePath: path.resolve(resolved.root, options.cachePath ?? '.vscode-test'),
+        version: process.env.VSCODE_VERSION ?? options.version,
+        platform: options.platform,
+        timeout: options.timeout
       });
     },
-    resolveId(id: string) {
+    resolveId: (id) => {
       // inline shim exposing the vscode API to test files
-      return id === 'vscode'
-        ? `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`
-        : undefined;
+      if (id === 'vscode')
+        return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
     }
   };
-}
-
-export async function downloadVSCodeExecutable(
-  options: Pick<VSCodeOptions, 'cachePath' | 'version' | 'platform' | 'timeout'>,
-): Promise<string> {
-  return downloadAndUnzipVSCode({
-    cachePath: options.cachePath,
-    version: process.env.VSCODE_VERSION ?? options.version,
-    platform: options.platform,
-    timeout: options.timeout
-  });
 }
