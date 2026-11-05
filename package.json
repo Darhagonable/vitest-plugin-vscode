@@ -44,10 +44,10 @@
   ],
   "dependencies": {
     "@vscode/test-electron": "^3.0.0",
-    "devalue": "^5.8.1"
+    "devalue": "^6.0.0"
   },
   "peerDependencies": {
-    "vitest": "^5.0.0"
+    "vitest": ">=5.0.0"
   },
   "devDependencies": {
     "@types/node": "^26.0.0",
