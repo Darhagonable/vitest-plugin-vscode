@@ -17,23 +17,16 @@ import type { VSCodeOptions } from './plugin';
 const require = createRequire(import.meta.url);
 
 // Warm extension hosts parked between watch reruns, keyed by project + files.
-const hosts = new Map<string, ExtensionHost>();
+export const hosts = new Map<string, ExtensionHost>();
 
-/** Tear down every warm host; wired to the plugin's vite closeServer hook. */
-export async function disposeHosts(): Promise<void> {
-  const warm = [...hosts.values()];
-  hosts.clear();
-  await Promise.all(warm.map(host => host.dispose(false)));
-}
-
+/** One live VS Code extension host; `events` is retargeted to its owner. */
 class ExtensionHost {
   private server?: net.Server;
   private ipc?: LineIpc;
   private run?: Promise<number>;
   private profilePath: string | undefined;
   private stopping = false;
-  dead = false;
-  sink?: EventEmitter;
+  events = new EventEmitter();
   private resolveStarted: (() => void) | undefined;
 
   constructor(
@@ -41,28 +34,28 @@ class ExtensionHost {
     private readonly options: VSCodeOptions
   ) {}
 
-  /** Boot if needed, then replay vitest's held start request; its 'started'
-   * reply (or the bridge closing) orders the run request after the worker's
-   * asynchronous handling of 'start'. */
   async start(start: unknown) {
-    const started = new Promise<void>((resolve) => (this.resolveStarted = resolve));
+    if (this.ipc)
+      return this.handshake(start);
 
-    if (!this.ipc) {
-      try {
-        await this.connect();
-      } catch (error) {
-        await this.dispose(true);
-        throw error;
-      }
-
-      this.run?.catch((error) => {
-        if (!this.stopping)
-          this.emitError(error);
-      });
+    try {
+      await this.connect();
+    } catch (error) {
+      await this.dispose(true);
+      throw error;
     }
 
-    this.send(start);
-    await started;
+    this.run?.catch((error) => {
+      if (!this.stopping)
+        this.emitError(error);
+    });
+
+    return this.handshake(start);
+  }
+
+  /** Replay the held start request; its reply orders what comes after it. */
+  private handshake(start: unknown) {
+    return new Promise<void>((resolve) => ((this.resolveStarted = resolve), this.send(start)));
   }
 
   send(message: unknown) {
@@ -197,18 +190,19 @@ class ExtensionHost {
     server.on('connection', (socket) => {
       this.ipc = new LineIpc(socket);
       this.ipc.on('message', (message) => {
-        if ((message as { type?: string }).type === 'started')
-          this.resolveStarted?.();
-        this.sink?.emit('message', message);
+        if ((message as { type?: string }).type === 'started') this.resolveStarted?.();
+        this.events.emit('message', message);
       });
       this.ipc.on('error', (error) => this.emitError(error));
+      // A closed bridge is never reused: clear it so a later start() cold-boots a fresh one.
       this.ipc.on('close', () => {
-        this.dead = true;
+        this.ipc = undefined, this.server?.close();
         this.resolveStarted?.();
-        if (this.stopping) return;
-        if (this.sink) this.sink.emit('exit');
-        // died while warm: nobody owns it, so clean it up here
-        else this.dispose(false).catch(() => undefined);
+        this.profilePath && rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
+        this.profilePath = undefined;
+
+        if (!this.stopping)
+          this.events.emit('exit');
       });
     });
 
@@ -220,101 +214,64 @@ class ExtensionHost {
   }
 
   emitError(error: unknown) {
-    const { sink } = this;
-    if (sink && sink.listenerCount('error') > 0)
-      sink.emit('error', error);
+    if (this.events.listenerCount('error') > 0) {
+      this.events.emit('error', error);
+    }
   }
 }
 
 /**
- * The pool worker vitest talks to. With isolate: true vitest only names the
- * task's files with the run request — after the start handshake — so this proxy
- * answers both handshakes itself and adopts (or boots) the host for exactly
- * those files, replaying what it held.
- */
-export class VSCodePoolWorker implements PoolWorker {
-  readonly name = 'vscodePool';
+ * The pool worker: a per-task face answering vitest's start/stop handshakes
+ * itself (files only arrive with the run request, after the handshake),
+ * adopting — or booting — the host keyed by exactly those files. */
+export function createPoolWorker(poolOptions: PoolOptions, options: VSCodeOptions): PoolWorker {
+  const events = new EventEmitter();
+  let host: ExtensionHost | undefined, startMessage: unknown, key = '', stopped = false;
 
-  private readonly events = new EventEmitter();
-  private startMessage: WorkerRequest | undefined;
-  private host: ExtensionHost | undefined;
-  private key: string | undefined;
-  private stopped = false;
+  return {
+    name: 'vscodePool',
+    on: (event: string, callback: (arg: unknown) => void) => events.on(event, callback),
+    off: (event: string, callback: (arg: unknown) => void) => events.off(event, callback),
+    deserialize: (data: unknown) => data,
+    async start() {},
+    send(message: WorkerRequest) {
+      if (host) {
+        // Recycling the worker must not kill a warm host: answer its stop handshake for it.
+        if (message.__vitest_worker_request__ && message.type === 'stop')
+          return void events.emit('message', { type: 'stopped', __vitest_worker_response__: true });
 
-  constructor(
-    private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
-  ) {}
+        return host.send(message);
+      }
 
-  on(event: string, callback: (arg: unknown) => void) {
-    this.events.on(event, callback);
-  }
+      // The run request is the only message naming the files: hold it and the
+      // handshake for the adopted host.
+      if (message.__vitest_worker_request__ && message.type === 'start') {
+        startMessage = message;
+        return void events.emit('message', { type: 'started', __vitest_worker_response__: true });
+      }
 
-  off(event: string, callback: (arg: unknown) => void) {
-    this.events.off(event, callback);
-  }
+      if (message.__vitest_worker_request__ && (message.type === 'run' || message.type === 'collect')) {
+        key = `${poolOptions.project.name}\n${message.context.files.map(file => file.filepath).join('\n')}`;
+        host = hosts.get(key) ?? new ExtensionHost(poolOptions, options);
+        host.events = events;
 
-  send(message: WorkerRequest) {
-    if (this.host) {
-      // Recycling the worker must not kill a warm host: answer the stop handshake for it.
-      if (message.__vitest_worker_request__ && message.type === 'stop')
-        return void this.events.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+        host.start(startMessage).then(
+          () => !stopped && host?.send(message),
+          error => host?.emitError(error)
+        );
+      }
+    },
+    async stop() {
+      stopped = true;
+      const owned = host;
+      if (!owned)
+        return; // still booting: stop() raced the run request, nothing to park
 
-      return this.host.send(message);
+      // Watch reruns reuse their file's warm host; other runs keep cold teardown.
+      if (poolOptions.project.config.watch && options.reuseWorker !== false)
+        hosts.set(key, owned);
+      else
+        await owned.dispose(false);
     }
-
-    // The run request is the only message naming the files, and it comes only
-    // after the handshake: answer locally and hold the message.
-    if (message.__vitest_worker_request__ && message.type === 'start') {
-      this.startMessage = message;
-      return void this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
-    }
-
-    if (message.__vitest_worker_request__ && (message.type === 'run' || message.type === 'collect'))
-      this.adopt(message.context.files, message);
-  }
-
-  deserialize(data: unknown) {
-    return data;
-  }
-
-  async start() {
-    // Nothing to boot yet: the host is chosen by the run request's files.
-  }
-
-  async stop() {
-    this.stopped = true;
-    const host = this.host;
-    this.host = undefined;
-
-    if (!host)
-      return; // still booting: the adopt continuation disposes it
-
-    host.sink = undefined;
-
-    // Watch reruns reuse their file's warm host; other runs keep cold teardown.
-    if (this.poolOptions.project.config.watch && this.options.reuseWorker !== false && !host.dead)
-      hosts.set(this.key!, host);
-    else
-      await host.dispose(false);
-  }
-
-  private adopt(files: { filepath: string }[], request: WorkerRequest) {
-    this.key = `${this.poolOptions.project.name}\n${files.map(file => file.filepath).join('\n')}`;
-
-    const warm = hosts.get(this.key);
-    const host = warm && !warm.dead ? warm : new ExtensionHost(this.poolOptions, this.options);
-    host.sink = this.events;
-
-    host.start(this.startMessage).then(
-      () => {
-        if (this.stopped)
-          return host.dispose(false);
-
-        this.host = host;
-        this.send(request);
-      },
-      (error) => host.emitError(error)
-    );
-  }
+  };
 }

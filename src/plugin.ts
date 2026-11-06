@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
-import { VSCodePoolWorker, disposeHosts } from './pool';
+import { createPoolWorker, hosts } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
 export interface VSCodeOptions {
@@ -90,7 +90,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       config.test ??= {};
       config.test.pool = {
         name: 'vscodePool',
-        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
+        createPoolWorker: (poolOptions) => createPoolWorker(poolOptions, options)
       };
     },
     configResolved: async (resolved) => {
@@ -106,6 +106,6 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       if (id === 'vscode')
         return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
     },
-    closeServer: () => disposeHosts()
+    closeServer: async () => void await Promise.all([...hosts.values()].map(host => host.dispose(false))),
   };
 }
