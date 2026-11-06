@@ -1,5 +1,6 @@
 import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -11,15 +12,32 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
-import type { PoolOptions, PoolWorker } from 'vitest/node';
+import type { PoolOptions, PoolWorker, WorkerRequest } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
 
+function isWorkerRequest(message: unknown): message is WorkerRequest {
+  return typeof message === 'object' && message !== null && '__vitest_worker_request__' in message;
+}
+
+function hasType(message: unknown): message is { type?: string } {
+  return typeof message === 'object' && message !== null && 'type' in message;
+}
+
+// Killed forks never run exit hooks: exit on SIGTERM so the hooks below run.
+process.once('SIGTERM', () => process.exit(0));
+
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
+  // The task sends through its `bridge`; adoption retargets the bridge's
+  // `events` to the task's emitter.
+  private events = new EventEmitter();
+  private bridge: VSCodePoolWorker | undefined;
+  private held: WorkerRequest | undefined;
+  private key = '';
+  private finished = false;
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
@@ -28,7 +46,8 @@ export class VSCodePoolWorker implements PoolWorker {
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker>
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -40,22 +59,27 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: unknown) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
-      return;
+    if (isWorkerRequest(message) && (message.type === 'stop' || (message.type === 'start' && !this.bridge))) {
+      // Synthetic acks: the files arrive only after 'started' (so hold that
+      // message for the bridge they pick); 'stop' must not kill a warm bridge.
+      this.held = message.type === 'start' ? message : this.held;
+      return void this.events.emit('message', { type: message.type === 'start' ? 'started' : 'stopped', __vitest_worker_response__: true });
     }
-
-    this.ipc.send(message);
+    if (this.bridge)
+      return void this.bridge.ipc?.send(message);
+    if (isWorkerRequest(message) && (message.type === 'run' || message.type === 'collect')) {
+      this.key = message.context.files.map(file => file.filepath).join('\n');
+      this.attach(message).catch(() => undefined);
+    }
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
+  async start() {} // deferred to send(): the run request picks the bridge
 
+  private async boot() {
     try {
       await this.connect();
     } catch (error) {
@@ -70,7 +94,36 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   async stop() {
-    await this.dispose(false);
+    const { bridge } = this;
+    // Park for the next same-files rerun, but only once this task finished:
+    // a cancelled run must not hand off a bridge still unwinding.
+    if (bridge && this.finished && this.poolOptions.project.config.watch && this.options.reuseWorker !== false)
+      this.instances.set(this.key, bridge);
+    else
+      await bridge?.dispose(false);
+  }
+
+  private async attach(message: WorkerRequest) {
+    try {
+      const bridge = this.instances.get(this.key) ?? new VSCodePoolWorker(this.poolOptions, this.options, this.instances);
+      this.instances.delete(this.key); // one bridge is never handed to two tasks
+      if (!bridge.ipc)
+        await bridge.boot();
+      (this.bridge = bridge).events = this.events;
+      // 'start' is handled asynchronously; its reply (or this bound, for a
+      // mute host) must order the run request after it.
+      await new Promise<void>((resolve, reject) => {
+        this.events.once('started', resolve);
+        setTimeout(() => reject(new Error('VS Code worker never finished starting.')), 30_000).unref();
+        if (this.held)
+          this.send(this.held);
+      });
+      this.events.on('message', (message: unknown) => { if (hasType(message) && message.type === 'testfileFinished') this.finished = true; });
+      this.send(message);
+    } catch (error) {
+      this.emitError(error);
+      await this.bridge?.dispose(false);
+    }
   }
 
   private async connect() {
@@ -81,7 +134,9 @@ export class VSCodePoolWorker implements PoolWorker {
     // the package in monorepos. Per-worker profiles live in the OS temp dir:
     // short (unix socket path limits) and cleaned up on stop.
     const config = this.poolOptions.project.config;
-    this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    const profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    this.profilePath = profilePath;
+    process.once('exit', () => rmSync(profilePath, { recursive: true, force: true }));
 
     // Per-worker user-data and extensions dirs go in first: concurrent VS Code
     // instances never share state and nothing lands at the CWD default.
@@ -152,7 +207,7 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
+  async dispose(hard: boolean) {
     this.stopping = true;
 
     try {
@@ -199,9 +254,10 @@ export class VSCodePoolWorker implements PoolWorker {
 
     server.on('connection', (socket) => {
       this.ipc = new LineIpc(socket);
-      this.ipc.on('message', (message) => this.events.emit('message', message));
+      this.ipc.on('message', (message: unknown) => this.events.emit(hasType(message) && message.type === 'started' ? 'started' : 'message', message));
       this.ipc.on('error', (error) => this.emitError(error));
       this.ipc.on('close', () => {
+        this.ipc = undefined; // a closed bridge is never adopted again
         if (!this.stopping)
           this.events.emit('exit');
       });
