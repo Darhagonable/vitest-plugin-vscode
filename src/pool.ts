@@ -1,6 +1,6 @@
 import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -11,24 +11,45 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
-import type { PoolOptions, PoolWorker } from 'vitest/node';
+import type { PoolOptions, PoolWorker, WorkerRequest, WorkerResponse } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
+type StartRequest = Extract<WorkerRequest, { type: 'start' }>;
+type RunRequest = Extract<WorkerRequest, { type: 'run' | 'collect' }>;
+
+// A SIGTERM'd fork never runs exit hooks; exiting normally re-fires them.
+process.once('SIGTERM', () => process.exit(0));
+
+function isWorkerRequest(message: unknown): message is WorkerRequest {
+  return typeof message === 'object' && message !== null
+    && '__vitest_worker_request__' in message && message.__vitest_worker_request__ === true;
+}
+
+function isWorkerResponse(message: unknown): message is WorkerResponse {
+  return typeof message === 'object' && message !== null
+    && '__vitest_worker_response__' in message && message.__vitest_worker_response__ === true;
+}
 
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
+  private events = new EventEmitter();
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  busy = false; // a task owns this host (R5): adopters wait for 'parked'
+  dead = false; // the bridge died under this host
+  private host: VSCodePoolWorker | undefined; // worker whose bridge closures route traffic
+  private startMessage: StartRequest | undefined; // held until the run request names the files
+  private key: string | undefined; // registry key of the host this worker holds
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker>
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -40,40 +61,72 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: unknown) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
-      return;
+    if (isWorkerRequest(message)) {
+      if (message.type === 'start') {
+        // The files arrive only with the run request, so vitest's handshake
+        // is answered here and replayed to the host in acquire().
+        this.startMessage = message;
+        return this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
+      }
+      if (message.type === 'run' || message.type === 'collect')
+        return void this.acquire(message);
     }
-
-    this.ipc.send(message);
+    this.ipc?.send(message);
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
-
-    try {
-      await this.connect();
-    } catch (error) {
-      await this.dispose(true);
-      throw error;
-    }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
-  }
+  async start() {} // the host is picked once the run request names the files
 
   async stop() {
-    await this.dispose(false);
+    this.busy = false;
+    this.events.emit('parked'); // wake adoption waiters
+    const { key } = this;
+    if (key && (this.dead || (this.host && this.options.reuseWorker === false))) {
+      this.instances.delete(key); // dead bridge or cold-boot mode: retire it
+      await this.dispose(this.dead);
+    } // else: it stays parked for the next run of these files
+  }
+
+  private async acquire(message: RunRequest) {
+    const key = JSON.stringify([this.poolOptions.project.name, ...message.context.files.map((file) => file.filepath).sort()]);
+    this.key = key;
+    this.busy = true;
+    try {
+      let host = this.instances.get(key);
+
+      while (host?.busy) { // wait out the previous task's stop handshake
+        await once(host.events, 'parked');
+        host = this.instances.get(key);
+      }
+      this.instances.set(key, this); // claim the slot for this worker's host
+      if (host && !host.dead && host.host && host.ipc) {
+        // Resurrect the parked host: harvest its bridge and retarget the routing.
+        Object.assign(this, { ipc: host.ipc, run: host.run, server: host.server, profilePath: host.profilePath, host: host.host });
+        host.host.events = this.events;
+      } else {
+        this.host = this;
+        await this.connect(); // a fresh boot (dead husks wait for the exit hook)
+      }
+
+      if (!this.busy) return; // cancelled while booting: stay parked
+      this.events.on('exit', () => (this.dead = true));
+      const { ipc } = this;
+      if (!ipc) throw new Error('The extension-host bridge is not connected.');
+      ipc.send(this.startMessage); // must not overtake the async setup
+      await Promise.race([once(this.events, 'started'), new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out starting the extension-host Vitest worker.')), 30_000).unref())]);
+      if (this.busy) ipc.send(message);
+    } catch (error) {
+      this.instances.delete(key);
+      await this.dispose(true);
+      this.emitError(error);
+    }
   }
 
   private async connect() {
+    process.once('exit', () => this.dispose(true)); // failed runs never reach closeServer
     const { server, port, connected } = await this.createServer();
     this.server = server;
 
@@ -152,7 +205,7 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
+  async dispose(hard: boolean) {
     this.stopping = true;
 
     try {
@@ -175,7 +228,7 @@ export class VSCodePoolWorker implements PoolWorker {
       this.stopping = false;
 
       if (this.profilePath) {
-        await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
+        rmSync(this.profilePath, { recursive: true, force: true });
         this.profilePath = undefined;
       }
     }
@@ -199,7 +252,7 @@ export class VSCodePoolWorker implements PoolWorker {
 
     server.on('connection', (socket) => {
       this.ipc = new LineIpc(socket);
-      this.ipc.on('message', (message) => this.events.emit('message', message));
+      this.ipc.on('message', (message: unknown) => this.events.emit(isWorkerResponse(message) && message.type === 'started' ? 'started' : 'message', message));
       this.ipc.on('error', (error) => this.emitError(error));
       this.ipc.on('close', () => {
         if (!this.stopping)
