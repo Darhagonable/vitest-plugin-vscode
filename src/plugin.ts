@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
-import { VSCodePoolWorker } from './pool';
+import { VSCodePoolWorker, WarmHosts } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
 export interface VSCodeOptions {
@@ -81,6 +81,10 @@ export interface VSCodeOptions {
 }
 
 export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
+  // Warm extension hosts outlive single tasks; they are tied to this plugin
+  // instance and, through closeServer, to the vite server's lifetime.
+  const warmHosts = new WarmHosts();
+
   return {
     name: 'vitest-plugin-vscode',
     config: (config) => {
@@ -90,7 +94,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       config.test ??= {};
       config.test.pool = {
         name: 'vscodePool',
-        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
+        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options, warmHosts)
       };
     },
     configResolved: async (resolved) => {
@@ -105,6 +109,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       // inline shim exposing the vscode API to test files
       if (id === 'vscode')
         return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
-    }
+    },
+    closeServer: () => warmHosts.close()
   };
 }
