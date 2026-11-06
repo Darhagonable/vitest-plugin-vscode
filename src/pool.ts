@@ -1,5 +1,6 @@
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -19,6 +20,10 @@ const require = createRequire(import.meta.url);
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
+  private host: VSCodePoolWorker | undefined;
+  private held: WorkerRequest | undefined;
+  private key = '';
+  private forward: LineIpc | undefined;
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
@@ -27,7 +32,8 @@ export class VSCodePoolWorker implements PoolWorker {
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker>
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -39,10 +45,19 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: WorkerRequest) {
-    if (!this.ipc)
-      throw new Error('VS Code extension-host worker is not connected.');
-
-    this.ipc.send(message);
+    switch (message.type) {
+      case 'stop': // parks only completed tasks — synthetic acks keep bridges alive
+        this.host && this.poolOptions.project.config.watch && this.options.reuseWorker !== false ? this.instances.set(this.key, this.host) : void this.host?.stop().catch(() => undefined);
+        return void this.ipc?.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+      case 'start':
+        if (this.host) break; // already attached: forward the raw start below
+        this.held = message; // cold only: the worker needs the real start (poolId/workerId)
+        return void this.ipc?.emit('message', { type: 'started', __vitest_worker_response__: true });
+      case 'run': case 'collect':
+        this.key = message.context.files.map(file => file.filepath).join('\n');
+        return void this.attach(message).catch(error => { this.ipc?.emit('error', error); void this.host?.stop().catch(() => undefined); });
+    }
+    if (this.host) return void this.host.ipc?.send(message);
   }
 
   deserialize(data: unknown) {
@@ -50,11 +65,15 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   async start() {
+    this.ipc = new LineIpc(new net.Socket()); this.ipc.on('error', () => {}); // placeholder for vitest's on()/off() (never replaced, so off() always hits it); sink for late pump emits
+  }
+  private async boot() {
     if (this.ipc)
       return;
 
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    process.once('exit', () => { if (this.profilePath) rmSync(this.profilePath, { recursive: true, force: true }); });
 
     // User launchArgs append last so they win by ordering.
     const launchArgs: string[] = [];
@@ -82,6 +101,7 @@ export class VSCodePoolWorker implements PoolWorker {
     try {
       this.server = net.createServer((socket) => {
         this.ipc = new LineIpc(socket);
+        for (const event of ['message', 'error', 'exit']) this.ipc.on(event, (...args: unknown[]) => { if (event === 'exit') this.ipc = undefined; this.forward?.emit(event, ...args); }); // exit also marks dead hosts for reboot
       });
 
       await once(this.server.listen(0, '127.0.0.1'), 'listening');
@@ -156,5 +176,15 @@ export class VSCodePoolWorker implements PoolWorker {
 
   canReuse() {
     return this.options.reuseWorker !== false;
+  }
+  private async attach(message: WorkerRequest) {
+    const host = this.instances.get(this.key) ?? new VSCodePoolWorker(this.poolOptions, this.options, this.instances);
+    this.instances.delete(this.key); // one bridge is never handed to two tasks
+    if (!host.ipc) { // cold: replay the real start; its reply (or a 30s bound) orders the run
+      await host.boot();
+      await Promise.race([new Promise<void>(resolve => { host.ipc?.once('message', resolve); host.ipc?.send(this.held); }), new Promise<never>((_, reject) => setTimeout(() => reject(new Error('VS Code worker never finished starting.')), 30_000).unref())]);
+    }
+    (this.host = host).forward = this.ipc;
+    this.host.ipc?.send(message);
   }
 }
