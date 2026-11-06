@@ -76,14 +76,13 @@ export interface VSCodeOptions {
    * timeout and does not enforce the total time VS Code may take to download.
    */
   timeout?: number;
-  /** Keep each test file's VS Code instance warm across watch-mode reruns. */
+  /** Keep VS Code instances warm between test runs (watch mode). */
   reuseWorker?: boolean;
 }
 
 export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
   // Extension hosts parked for watch-mode reuse outlive the task that booted
-  // them; the plugin owns their lifetime so all of them are torn down with
-  // the Vite server.
+  // them; the plugin disposes them all when the Vite server closes.
   const warm = new WarmInstances();
 
   return {
