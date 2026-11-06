@@ -1,6 +1,11 @@
 import * as vscode from 'vscode';
+import { writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { activate } from '../src/extension';
+
+// The e2e suite asserts pid continuity across watch reruns to prove warm
+// extension-host reuse (a cold boot would produce a different pid).
+const hostPidFile = new URL('../.e2e-host-pid-vscode-api-pass', import.meta.url);
 
 describe('vscode API', () => {
   it('exposes the extension host API', () => {
@@ -16,6 +21,10 @@ describe('vscode API', () => {
 
   it('forwards console output to vitest', () => {
     console.log('e2e: console forwarded from the extension host');
+  });
+
+  it('records which extension host process ran it', () => {
+    writeFileSync(hostPidFile, String(process.pid));
   });
 });
 
