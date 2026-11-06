@@ -5,6 +5,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
+import { Writable } from 'node:stream';
 import {
   runTests,
   SilentReporter,
@@ -106,10 +107,28 @@ export class VSCodePoolWorker implements PoolWorker {
     if (this.options.launchArgs)
       launchArgs.push(...this.options.launchArgs);
 
+    // Pin the logs root to the per-worker profile (honored verbatim by VS
+    // Code's environment service) and default `--log` to `info`: the
+    // extension host log is the diagnostics source consumed by the worker
+    // after every run. A user-provided `--log` in launchArgs wins.
+    const logsDir = path.join(this.profilePath, 'logs');
+    launchArgs.push(`--logsPath=${logsDir}`);
+    if (!hasLogFlag(launchArgs))
+      launchArgs.push('--log', 'info');
+
     // VS Code's Vitest extension runs test processes under Electron-as-Node.
     // The spawned VS Code must start as Electron, not inherit that mode.
     // runTests() merges process.env, so sanitize the environment directly.
     delete process.env.ELECTRON_RUN_AS_NODE;
+
+    // The launched VS Code writes verbose workbench logs to stdout/stderr.
+    // That stream is noise for the reporter — swallow it; errors and
+    // warnings are consumed from the extension host log instead.
+    const sink = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      }
+    });
 
     this.run = runTests({
       vscodeExecutablePath: this.options.vscodeExecutablePath,
@@ -121,10 +140,15 @@ export class VSCodePoolWorker implements PoolWorker {
       reuseMachineInstall: this.options.reuseMachineInstall,
       extensionTestsEnv: {
         VITEST_RUNNER_IPC_HOST: '127.0.0.1',
-        VITEST_RUNNER_IPC_PORT: String(port)
+        VITEST_RUNNER_IPC_PORT: String(port),
+        // Where the worker consumes extension host diagnostics from (see
+        // failOnExthostErrors in vscode-worker.ts).
+        VSCODE_RUNNER_LOGS_DIR: logsDir
       },
       launchArgs,
-      reporter: new SilentReporter()
+      reporter: new SilentReporter(),
+      stdout: sink,
+      stderr: sink
     });
     let bridgeConnected = false;
     const connectedBeforeExit = connected.then(() => {
@@ -174,8 +198,15 @@ export class VSCodePoolWorker implements PoolWorker {
       this.run = undefined;
       this.stopping = false;
 
+      // Removes the per-worker profile, unless `VSCODE_RUNNER_DEBUG_LOGS`
+      // is set — then it is kept (with a pointer printed to the reporter)
+      // so the extension host logs can be inspected by hand.
       if (this.profilePath) {
-        await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
+        if (process.env.VSCODE_RUNNER_DEBUG_LOGS)
+          console.error(`[vscode] keeping VS Code logs for inspection: ${path.join(this.profilePath, 'logs')}`);
+        else
+          await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
+
         this.profilePath = undefined;
       }
     }
@@ -219,4 +250,8 @@ export class VSCodePoolWorker implements PoolWorker {
       this.events.emit('error', error);
     }
   }
+}
+
+function hasLogFlag(args: string[]): boolean {
+  return args.some(arg => arg === '--log' || arg.startsWith('--log='));
 }

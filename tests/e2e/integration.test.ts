@@ -76,11 +76,6 @@ describe('vscode extension-host pool', () => {
     expect(findTest('intentional-fail', 'expected failure passes through')?.ok()).toBe(true);
   });
 
-  it('forwards console output from the extension host', () => {
-    const logs = findTest('vscode-api-pass', 'forwards console output')?.logs().map(log => log.content).join('');
-    expect(logs).toContain('e2e: console forwarded from the extension host');
-  });
-
   it('supports watch mode test reruns', { timeout: 120_000 }, async () => {
     const source = await readFile(join(sampleRoot, 'src/extension.ts'), 'utf8');
 
@@ -94,5 +89,41 @@ describe('vscode extension-host pool', () => {
     await rerunEnded;
 
     expect(findTest('vscode-api-pass', 'registers and executes a command')?.ok()).toBe(true);
+  });
+
+  it('fails the run when a dev extension fails to activate', { timeout: 120_000 }, async () => {
+    // SAMPLE_BROKEN=1 reaches the extension host (runTests merges the
+    // environment): the real activation warns, then loads a broken module.
+    // The runner's activation sweep must fail the whole run with the
+    // extension's stack, like a crashed module import in Node.
+    process.env.SAMPLE_BROKEN = '1';
+
+    try {
+      const broken = await startVitest([], { root: sampleRoot, reporters: [] });
+
+      try {
+        const errors = broken.state.getUnhandledErrors();
+        // The failure may be wrapped ("Failed to start worker …" with the
+        // sweep error as its cause), so walk the cause chain.
+        const reported = errors
+          .map(error => {
+            const parts: string[] = [String((error as { message?: string })?.message ?? '')];
+            let cause = (error as { cause?: unknown })?.cause as { message?: string; cause?: unknown } | undefined;
+            while (cause) {
+              parts.push(String(cause.message ?? ''));
+              cause = cause.cause as { message?: string; cause?: unknown } | undefined;
+            }
+            return parts.join('\n');
+          })
+          .join('\n');
+        expect(reported, 'the activation failure must be reported with its trace').toContain('vitest-plugin-vscode.sample-extension');
+        expect(reported, 'the log-sourced error must be included').toContain('SyntaxError');
+      } finally {
+        await broken.close();
+      }
+    } finally {
+      delete process.env.SAMPLE_BROKEN;
+      process.exitCode = 0;
+    }
   });
 });

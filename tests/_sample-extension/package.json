@@ -1,5 +1,6 @@
 {
   "name": "sample-extension",
+  "publisher": "vitest-plugin-vscode",
   "displayName": "Sample Extension",
   "description": "Fixture VS Code extension used as the dev-extension host for the runner's own test suite.",
   "version": "0.0.0",
@@ -7,6 +8,10 @@
   "engines": {
     "vscode": "^1.120.0"
   },
+  "main": "./src/extension-main.mjs",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "type": "module",
   "devDependencies": {
     "vitest-plugin-vscode": "workspace:*"

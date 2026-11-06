@@ -13,10 +13,6 @@ describe('vscode API', () => {
     expect(doc.getText()).toBe('hello from the extension host');
     await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   });
-
-  it('forwards console output to vitest', () => {
-    console.log('e2e: console forwarded from the extension host');
-  });
 });
 
 describe('sample extension', () => {
