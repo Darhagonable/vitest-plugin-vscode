@@ -11,24 +11,29 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
-import type { PoolOptions, PoolWorker } from 'vitest/node';
+import type { PoolOptions, PoolWorker, WorkerRequest } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
 
+process.on('SIGTERM', () => process.exit(143)); // signal deaths skip 'exit' hooks: re-enter
+
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
+  private events = new EventEmitter();
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private host!: VSCodePoolWorker; // set by bind(); 'run'/'stop' never precede it
+  private buffered: unknown[] = [];
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker> = new Map()
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -39,38 +44,39 @@ export class VSCodePoolWorker implements PoolWorker {
     this.events.off(event, callback);
   }
 
-  send(message: unknown) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
-      return;
-    }
-
-    this.ipc.send(message);
+  send(message: WorkerRequest) {
+    // 'start' acks locally (replayed in bind); 'stop' never forwards and
+    // follows only normal completion: park — quarantined, the bind-time
+    // claim stands — or dispose; forced cancels leave the claim to closeServer.
+    if (message.type === 'start' || message.type === 'stop') {
+      this.events.emit('message', { type: message.type === 'start' ? 'started' : 'stopped', __vitest_worker_response__: true });
+      if (message.type === 'start') this.buffered.push(message);
+      else if (this.canReuse() && this.poolOptions.project.config.watch) this.host.events = new EventEmitter();
+      else void this.host.dispose(!this.host.ipc);
+    } else if (message.type === 'run' || message.type === 'collect')
+      this.bind(message).catch((error) => { void this.host.dispose(true); this.emitError(error); });
+    else this.host?.ipc?.send(message);
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
-
-    try {
-      await this.connect();
-    } catch (error) {
-      await this.dispose(true);
-      throw error;
-    }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
-  }
+  async start() {} // the task's files arrive only with the run request
 
   async stop() {
     await this.dispose(false);
+  }
+
+  private async bind(runRequest: Extract<WorkerRequest, { type: 'run' | 'collect' }>) {
+    const key = `${this.poolOptions.project.name}|${runRequest.context.files.map((file) => file.filepath)}`;
+    this.instances.set(key, this.host = this.instances.get(key) ?? new VSCodePoolWorker(this.poolOptions, this.options, this.instances));
+    this.host.events = this.events;
+    if (!this.host.ipc) await this.host.connect();
+    for (const buffered of this.buffered) this.host.ipc?.send(buffered);
+    await Promise.race([once(this.events, 'gate'), new Promise((_, reject) => // gate on the host's genuine 'started': its runtime handles 'start' async
+      setTimeout(reject, 60_000, new Error('Timed out waiting for the extension host to accept a run.')).unref())]);
+    this.host.ipc?.send(runRequest);
   }
 
   private async connect() {
@@ -82,6 +88,13 @@ export class VSCodePoolWorker implements PoolWorker {
     // short (unix socket path limits) and cleaned up on stop.
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    // a run dying before closeServer still loses its profile: wait out its host, sweep
+    process.once('exit', () => {
+      if (!this.profilePath) return;
+      this.ipc?.destroy();
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+      require('node:fs').rmSync(this.profilePath, { recursive: true, force: true });
+    });
 
     // Per-worker user-data and extensions dirs go in first: concurrent VS Code
     // instances never share state and nothing lands at the CWD default.
@@ -152,12 +165,13 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
+  async dispose(hard: boolean) {
     this.stopping = true;
 
     try {
       if (hard) {
         this.ipc?.destroy();
+        this.run?.catch(() => {}); // a late rejection must not surface unhandled
       } else {
         this.ipc?.close();
         // No timeout: vitest's own teardownTimeout bounds the whole pool.
@@ -172,7 +186,6 @@ export class VSCodePoolWorker implements PoolWorker {
       this.ipc = undefined;
       this.server = undefined;
       this.run = undefined;
-      this.stopping = false;
 
       if (this.profilePath) {
         await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
@@ -200,10 +213,11 @@ export class VSCodePoolWorker implements PoolWorker {
     server.on('connection', (socket) => {
       this.ipc = new LineIpc(socket);
       this.ipc.on('message', (message) => this.events.emit('message', message));
+      this.ipc.on('message', (message: { type?: string }) => { if (message.type === 'started') this.events.emit('gate'); });
       this.ipc.on('error', (error) => this.emitError(error));
       this.ipc.on('close', () => {
-        if (!this.stopping)
-          this.events.emit('exit');
+        for (const [key, host] of this.instances) if (host === this) this.instances.delete(key);
+        if (!this.stopping) { void this.dispose(true); this.events.emit('exit'); }
       });
     });
 
