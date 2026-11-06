@@ -20,12 +20,14 @@ export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
   private server: net.Server | undefined;
-  private ipc: LineIpc | undefined;
+  private ipc: LineIpc | undefined = new LineIpc(new net.Socket()); // placeholder: vitest subscribes here; the facade's field never moves
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private host!: VSCodePoolWorker;
 
   constructor(
+    private readonly instances: Map<string, VSCodePoolWorker>,
     private readonly poolOptions: PoolOptions,
     private readonly options: VSCodeOptions
   ) {}
@@ -39,20 +41,21 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: WorkerRequest) {
-    if (!this.ipc)
-      throw new Error('VS Code extension-host worker is not connected.');
-
-    this.ipc.send(message);
+    switch (message.type) {
+      case 'start': return this.ipc?.emit('message', { type: 'started', __vitest_worker_response__: true }); // toll: the placeholder cannot genuinely ack
+      case 'stop': return this.ipc?.emit('message', { type: 'stopped', __vitest_worker_response__: true }); // toll: teardown waits; the parked runtime must never see the real one
+      case 'run': case 'collect': return void this._start(message.context.files[0].filepath, message);
+    }
+    this.host.ipc?.send(message);
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
+  async start() {} // vitest's task-time start: the facade must never boot — hosts use launch()
 
+  private async launch() { // main's start body minus its guard: a fresh host's placeholder ipc would trip it
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
 
@@ -130,7 +133,25 @@ export class VSCodePoolWorker implements PoolWorker {
     }
   }
 
+  private async _start(file: string, request: WorkerRequest) {
+    const host = this.instances.get(file) ?? new VSCodePoolWorker(this.instances, this.poolOptions, this.options);
+    if (this.poolOptions.project.config.watch && this.canReuse()) this.instances.set(file, host);
+    this.host = host;
+    if (!host.server) {
+      await host.launch();
+      host.ipc?.send({ type: 'start', __vitest_worker_request__: true, options: { reportMemory: false }, traces: { enabled: false }, context: { environment: { name: this.poolOptions.project.config.environment,
+        options: this.poolOptions.project.config.environmentOptions }, config: this.poolOptions.project.serializedConfig, pool: this.name } }); // reconstructed start: the cold runtime bootstraps from it
+      await (host.ipc ? once(host.ipc, 'message', { signal: AbortSignal.timeout(30_000) }) : undefined); // gate: run waits for the runtime's genuine reply
+    }
+    host.ipc?.removeAllListeners(); // retire the previous task's pump before re-subscribing
+    for (const event of ['message', 'error', 'exit'])
+      host.ipc?.on(event, (argument) => this.ipc?.emit(event, argument)); // the pump: host bridge into this task's placeholder
+    host.ipc?.send(request);
+  }
+
   async stop() {
+    if (![...this.instances.values()].includes(this.host))
+      void this.host?.stop(); // non-watch: retire the booted host; the body below is inert against this facade's placeholder
     this.stopping = true;
     try {
       this.ipc?.close();
