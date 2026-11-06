@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
-import { VSCodePoolWorker, shutdownWarmConnections } from './pool';
+import { VSCodePoolWorker, shutdownWarmInstances } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
 export interface VSCodeOptions {
@@ -110,7 +110,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
     // pool is closed. Deterministic cleanup for parked VS Code instances —
     // awaited so vitest exits only after every instance is gone.
     closeServer: async () => {
-      await shutdownWarmConnections();
+      await shutdownWarmInstances();
     }
   };
 }
