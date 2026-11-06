@@ -11,10 +11,17 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
-import type { PoolOptions, PoolWorker } from 'vitest/node';
+import type { PoolOptions, PoolWorker, WorkerRequest } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
+
+type RunRequest = Extract<WorkerRequest, { type: 'run' | 'collect' }>;
+
+/** Hosts kept alive after their task: reused when the same files rerun. */
+const warmHosts = new Map<string, VSCodePoolWorker>();
+/** Every booted host, for teardown when the Vite server closes. */
+const liveHosts = new Set<VSCodePoolWorker>();
 
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
@@ -25,6 +32,11 @@ export class VSCodePoolWorker implements PoolWorker {
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private key = '';
+  private host: VSCodePoolWorker | undefined;
+  private buffered: unknown[] = [];
+  private finished = false;
+  private stopped = false;
 
   constructor(
     private readonly poolOptions: PoolOptions,
@@ -40,42 +52,159 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: unknown) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
+    if (this.stopped)
       return;
+
+    if ((message as WorkerRequest).__vitest_worker_request__) {
+      switch ((message as WorkerRequest).type) {
+        // Answered locally; replayed to the host once one is adopted.
+        case 'start':
+          this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
+          this.buffered.push(message);
+          return;
+        // Never forwarded: the host must outlive this task's worker.
+        case 'stop':
+          this.events.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+          return;
+        case 'run':
+        case 'collect':
+          void this.bind(message as RunRequest);
+          return;
+      }
     }
 
-    this.ipc.send(message);
+    if (this.host)
+      this.host.rawSend(message);
+    else
+      this.buffered.push(message);
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
+  // Nothing to start: the task's files arrive only with the run request.
+  async start() {}
+
+  async stop() {
+    this.stopped = true;
+
+    const host = this.host;
+    this.host = undefined;
+
+    if (!host || host.stopping)
+      return;
+
+    if (this.finished && this.options.reuseWorker !== false && this.poolOptions.project.config.watch)
+      warmHosts.set(host.key, host);
+    else
+      await host.dispose(!this.finished);
+  }
+
+  private async bind(runRequest: RunRequest) {
+    // Project + files, so a file always returns to its own extension host.
+    const key = `${this.poolOptions.project.name}|${runRequest.context.files.map((file) => file.filepath)}`;
+    let host = warmHosts.get(key);
+    warmHosts.delete(key);
+
+    if (!host) {
+      host = new VSCodePoolWorker(this.poolOptions, this.options);
+
+      try {
+        await host.connect();
+      } catch (error) {
+        void host.dispose(true);
+        this.emitError(error);
+        return;
+      }
+
+      liveHosts.add(host);
+    }
+
+    if (this.stopped) { // cancelled while the extension host booted
+      void host.dispose(true);
+      return;
+    }
+
+    host.key = key;
+    this.host = host;
+    this.finished = false;
+    host.events.on('message', this.relayMessage);
+    host.events.on('error', this.relayError);
+    host.events.on('exit', this.relayExit);
+
+    for (const buffered of this.buffered)
+      host.rawSend(buffered);
+    this.buffered = [];
+
+    try {
+      // The host's genuine "started" reply orders its async start handling
+      // before the run; the local ack above cannot.
+      await this.waitForStart(host);
+    } catch (error) {
+      this.emitError(error);
+      return;
+    }
+
+    if (!this.stopped)
+      host.rawSend(runRequest);
+  }
+
+  private waitForStart(host: VSCodePoolWorker) {
+    return new Promise<void>((resolve, reject) => {
+      const onStarted = (message: { type?: string; error?: unknown }) => {
+        if (message?.type !== 'started')
+          return;
+
+        host.events.off('message', onStarted);
+        message.error ? reject(message.error) : resolve();
+      };
+      host.events.on('message', onStarted);
+      host.events.once('exit', () => reject(new Error('The extension host exited before accepting a run.')));
+    });
+  }
+
+  private readonly relayMessage = (message: { type?: string }) => {
+    if (message.type === 'testfileFinished')
+      this.finished = true;
+
+    this.events.emit('message', message);
+  };
+
+  private readonly relayError = (error: unknown) => this.emitError(error);
+
+  private readonly relayExit = () => {
+    if (!this.stopped)
+      this.events.emit('exit');
+  };
+
+  private rawSend(message: unknown) {
+    this.ipc?.send(message);
+  }
+
+  private async connect() {
     if (this.ipc)
       return;
 
     try {
-      await this.connect();
+      await this.createServer();
     } catch (error) {
       await this.dispose(true);
       throw error;
     }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
   }
 
-  async stop() {
-    await this.dispose(false);
-  }
+  private async createServer() {
+    const server = net.createServer();
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
 
-  private async connect() {
-    const { server, port, connected } = await this.createServer();
-    this.server = server;
+    const address = server.address();
+
+    if (!address || typeof address === 'string') {
+      server.close();
+      throw new Error('Could not allocate IPC port for VS Code Vitest worker.');
+    }
 
     // Anchor the download cache at the project root so nothing leaks outside
     // the package in monorepos. Per-worker profiles live in the OS temp dir:
@@ -121,11 +250,31 @@ export class VSCodePoolWorker implements PoolWorker {
       reuseMachineInstall: this.options.reuseMachineInstall,
       extensionTestsEnv: {
         VITEST_RUNNER_IPC_HOST: '127.0.0.1',
-        VITEST_RUNNER_IPC_PORT: String(port)
+        VITEST_RUNNER_IPC_PORT: String(address.port)
       },
       launchArgs,
       reporter: new SilentReporter()
     });
+    // A late rejection (a disposed host) must not surface as unhandled.
+    this.run.catch(() => {});
+    const connected = once(server, 'connection');
+
+    this.server = server;
+    server.on('connection', (socket) => {
+      this.ipc = new LineIpc(socket);
+      this.ipc.on('message', (message) => this.events.emit('message', message));
+      this.ipc.on('error', (error) => this.emitError(error));
+      this.ipc.on('close', () => {
+        warmHosts.delete(this.key);
+        liveHosts.delete(this);
+
+        if (!this.stopping) {
+          void this.dispose(true);
+          this.events.emit('exit');
+        }
+      });
+    });
+
     let bridgeConnected = false;
     const connectedBeforeExit = connected.then(() => {
       bridgeConnected = true;
@@ -152,7 +301,7 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
+  async dispose(hard: boolean) {
     this.stopping = true;
 
     try {
@@ -172,7 +321,6 @@ export class VSCodePoolWorker implements PoolWorker {
       this.ipc = undefined;
       this.server = undefined;
       this.run = undefined;
-      this.stopping = false;
 
       if (this.profilePath) {
         await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
@@ -181,42 +329,14 @@ export class VSCodePoolWorker implements PoolWorker {
     }
   }
 
-  canReuse() {
-    return this.options.reuseWorker !== false;
-  }
-
-  private async createServer() {
-    const server = net.createServer();
-    server.listen(0, '127.0.0.1');
-    await once(server, 'listening');
-
-    const address = server.address();
-
-    if (!address || typeof address === 'string') {
-      server.close();
-      throw new Error('Could not allocate IPC port for VS Code Vitest worker.');
-    }
-
-    server.on('connection', (socket) => {
-      this.ipc = new LineIpc(socket);
-      this.ipc.on('message', (message) => this.events.emit('message', message));
-      this.ipc.on('error', (error) => this.emitError(error));
-      this.ipc.on('close', () => {
-        if (!this.stopping)
-          this.events.emit('exit');
-      });
-    });
-
-    return {
-      server,
-      port: address.port,
-      connected: once(server, 'connection')
-    };
-  }
-
   private emitError(error: unknown) {
     if (this.events.listenerCount('error') > 0) {
       this.events.emit('error', error);
     }
   }
+}
+
+/** Reap every host; the plugin calls this when the Vite server closes. */
+export async function disposeAllHosts() {
+  await Promise.all([...liveHosts].map((host) => host.dispose(false)));
 }
