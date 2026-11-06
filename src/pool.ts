@@ -1,5 +1,6 @@
 import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -19,7 +20,10 @@ const require = createRequire(import.meta.url);
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
+  private events = new EventEmitter();
+  private bridge: VSCodePoolWorker | undefined;
+  private held: WorkerRequest | undefined;
+  private key = '';
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
@@ -28,7 +32,8 @@ export class VSCodePoolWorker implements PoolWorker {
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker>
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -40,24 +45,38 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: WorkerRequest) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
-      return;
+    if (message.type === 'stop' || (message.type === 'start' && !this.bridge)) {
+      // Synthetic acks: the files arrive only after 'started' (hold that
+      // message for the bridge they pick); 'stop' comes only after a completed
+      // task — park the warm bridge (never one still unwinding) or kill it.
+      if (message.type === 'stop' && this.bridge && this.poolOptions.project.config.watch && this.options.reuseWorker !== false)
+        this.instances.set(this.key, this.bridge);
+      else if (message.type === 'stop') void this.bridge?.stop().catch(() => undefined);
+      this.held = message.type === 'start' ? message : this.held;
+      return void this.events.emit('message', { type: message.type === 'start' ? 'started' : 'stopped', __vitest_worker_response__: true });
     }
-
-    this.ipc.send(message);
+    if (this.bridge) return void this.bridge.ipc?.send(message);
+    if (message.type === 'run' || message.type === 'collect') {
+      this.key = message.context.files.map(file => file.filepath).join('\n');
+      this.attach(message).catch(error => { this.emitError(error); void this.bridge?.stop().catch(() => undefined); });
+    }
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
+  async start() {} // deferred to send(): the run request picks the bridge
+
+  private async boot() {
     if (this.ipc)
       return;
 
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    process.once('exit', () => {
+      if (this.profilePath) rmSync(this.profilePath, { recursive: true, force: true });
+    });
 
     // User launchArgs append last so they win by ordering.
     const launchArgs: string[] = [];
@@ -88,6 +107,7 @@ export class VSCodePoolWorker implements PoolWorker {
         this.ipc.on('message', (message) => this.events.emit('message', message));
         this.ipc.on('error', (error) => this.emitError(error));
         this.ipc.on('close', () => {
+          this.ipc = undefined; // a closed bridge is never adopted again
           if (!this.stopping)
             this.events.emit('exit');
         });
@@ -170,6 +190,18 @@ export class VSCodePoolWorker implements PoolWorker {
 
   canReuse() {
     return this.options.reuseWorker !== false;
+  }
+
+  private async attach(message: WorkerRequest) {
+    const bridge = this.instances.get(this.key) ?? new VSCodePoolWorker(this.poolOptions, this.options, this.instances);
+    this.instances.delete(this.key); // one bridge is never handed to two tasks
+    if (!bridge.ipc) await bridge.boot();
+    (this.bridge = bridge).events = this.events;
+    // 'start' is handled asynchronously; its reply (or a 30s bound, for a mute host) orders the run.
+    const reply = new Promise<void>(resolve => this.events.on('message', (m: { type?: string }) => { if (m.type === 'started') resolve(); }));
+    bridge.ipc?.send(this.held);
+    await Promise.race([reply, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('VS Code worker never finished starting.')), 30_000).unref())]);
+    bridge.ipc?.send(message);
   }
 
   private emitError(error: unknown) {
