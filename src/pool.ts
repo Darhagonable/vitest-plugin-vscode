@@ -1,6 +1,6 @@
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -24,11 +24,12 @@ export class VSCodePoolWorker implements PoolWorker {
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private key: string | undefined;
+  private startMessage: Extract<WorkerRequest, { type: 'start' }> | undefined; // cold-only hold (see boot)
+  private host: VSCodePoolWorker | undefined; // the boot worker whose bridge serves this task
+  private bridge: LineIpc | undefined; // the host's real socket; sends route here
 
-  constructor(
-    private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
-  ) {}
+  constructor(private readonly poolOptions: PoolOptions, private readonly options: VSCodeOptions, private readonly instances: Map<string, VSCodePoolWorker>) {}
 
   on(event: string, callback: (arg: unknown) => void) {
     this.ipc?.on(event, callback);
@@ -39,20 +40,25 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: WorkerRequest) {
-    if (!this.ipc)
-      throw new Error('VS Code extension-host worker is not connected.');
-
-    this.ipc.send(message);
+    switch (message.type) {
+      case 'run': case 'collect': return void this.dispatch(message);
+      case 'start': case 'stop': // shared synthetic ack; start also holds its message for the cold replay
+        this.startMessage = message.type === 'start' ? message : this.startMessage;
+        this.ipc?.emit('message', { type: message.type === 'start' ? 'started' : 'stopped', __vitest_worker_response__: true });
+        if (message.type === 'stop' && this.key && this.options.reuseWorker !== false && this.poolOptions.project.config.watch)
+          this.instances.set(this.key, this.host ?? this); // {stop} = normal completion only; cancels never post it
+        return;
+      default: this.bridge?.send(message);
+    }
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
+  async start() { this.ipc = new LineIpc(new net.Socket()); this.ipc.on('error', () => {}); } // placeholder: vitest's verbatim on/off lives here for this task's whole life
 
+  private async boot(): Promise<LineIpc> {
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
 
@@ -81,7 +87,8 @@ export class VSCodePoolWorker implements PoolWorker {
 
     try {
       this.server = net.createServer((socket) => {
-        this.ipc = new LineIpc(socket);
+        this.bridge = new LineIpc(socket);
+        for (const event of ['message', 'error', 'exit']) this.bridge.on(event, (arg) => this.ipc === this.bridge || this.ipc?.emit(event, arg)); // never re-emit into the bridge (post-swap self-recycle)
       });
 
       await once(this.server.listen(0, '127.0.0.1'), 'listening');
@@ -121,6 +128,10 @@ export class VSCodePoolWorker implements PoolWorker {
         if (!this.stopping)
           this.ipc?.emit('error', error);
       });
+      process.once('exit', () => { this.ipc = this.bridge ?? this.ipc; this.cleanup(); }); // R2 sweep, idempotent per host
+      this.bridge!.send(this.startMessage); // cold-only hold: the host's init() needs the real 'start'
+      await Promise.race([once(this.bridge!, 'message'), new Promise<never>((_, reject) => setTimeout(() => reject(new Error('VS Code extension host did not report startup.')), 30_000).unref())]); // and the request must not race its async handler
+      return this.bridge!;
     } catch (error) {
       await this.cleanup();
       throw error;
@@ -128,6 +139,8 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   async stop() {
+    if (this.instances.get(this.key ?? '') === (this.host ?? this)) return; // parked: the host outlives this task
+    this.ipc = this.bridge ?? this.ipc; // teardown targets the real bridge (offs already hit the placeholder)
     this.stopping = true;
     try {
       this.ipc?.close();
@@ -140,6 +153,15 @@ export class VSCodePoolWorker implements PoolWorker {
     }
   }
 
+  private async dispatch(request: Extract<WorkerRequest, { type: 'run' | 'collect' }>) {
+    this.key = `${this.poolOptions.project.config.root}\0${request.context.files.map((file) => file.filepath).join()}`;
+    const parked = this.instances.get(this.key); this.instances.delete(this.key);
+    try {
+      if (parked) (this.host = parked).ipc = this.ipc; // retarget the host's pump at this task's placeholder
+      const bridge = this.bridge = parked?.bridge ?? await this.boot(); // boot = connect + 'start' handshake
+      bridge.send(request);
+    } catch (error) { this.ipc?.emit('error', error); } // vitest's reject → force-stop tears down
+  }
   private async cleanup() {
     this.stopping = true;
     this.ipc?.destroy();
@@ -148,7 +170,7 @@ export class VSCodePoolWorker implements PoolWorker {
     this.server = undefined;
     this.run = undefined;
     if (this.profilePath) {
-      await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
+      rmSync(this.profilePath, { recursive: true, force: true }); // sync: reused by the process-exit hook
       this.profilePath = undefined;
     }
     this.stopping = false;
