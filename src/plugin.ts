@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
-import { VSCodePoolWorker } from './pool';
+import { VSCodePoolWorker, WarmInstances } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
 export interface VSCodeOptions {
@@ -76,11 +76,16 @@ export interface VSCodeOptions {
    * timeout and does not enforce the total time VS Code may take to download.
    */
   timeout?: number;
-  /** Keep VS Code instances warm between test runs (watch mode). */
+  /** Keep each test file's VS Code instance warm across watch-mode reruns. */
   reuseWorker?: boolean;
 }
 
 export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
+  // Extension hosts parked for watch-mode reuse outlive the task that booted
+  // them; the plugin owns their lifetime so all of them are torn down with
+  // the Vite server.
+  const warm = new WarmInstances();
+
   return {
     name: 'vitest-plugin-vscode',
     config: (config) => {
@@ -90,7 +95,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       config.test ??= {};
       config.test.pool = {
         name: 'vscodePool',
-        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
+        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options, warm)
       };
     },
     configResolved: async (resolved) => {
@@ -105,6 +110,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       // inline shim exposing the vscode API to test files
       if (id === 'vscode')
         return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
-    }
+    },
+    closeServer: () => warm.flush()
   };
 }
