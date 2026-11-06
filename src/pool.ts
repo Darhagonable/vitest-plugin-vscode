@@ -1,6 +1,7 @@
 import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -11,24 +12,43 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
-import type { PoolOptions, PoolWorker } from 'vitest/node';
+import type { PoolOptions, PoolWorker, WorkerRequest, WorkerResponse } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
 
+/** Every message vitest's pool sends a worker carries this marker. */
+function isWorkerRequest(message: unknown): message is WorkerRequest {
+  return typeof message === 'object' && message !== null
+    && '__vitest_worker_request__' in message && message.__vitest_worker_request__ === true
+    && 'type' in message && typeof message.type === 'string';
+}
+
+/** Every reply the extension host sends back to the pool carries this marker. */
+function isWorkerResponse(message: unknown): message is WorkerResponse {
+  return typeof message === 'object' && message !== null
+    && '__vitest_worker_response__' in message && message.__vitest_worker_response__ === true
+    && 'type' in message && typeof message.type === 'string';
+}
+
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
+  private events = new EventEmitter();
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private host: VSCodePoolWorker | undefined;
+  private file: string | undefined;
+  private startRequest: WorkerRequest | undefined;
+  private clean = false;
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker>
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -40,6 +60,21 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: unknown) {
+    // Answer the start handshake in place of the extension host: the file
+    // this task runs is only named by the run request that follows it.
+    if (isWorkerRequest(message) && message.type === 'start') {
+      this.startRequest = message;
+      return this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
+    }
+    if (isWorkerRequest(message) && (message.type === 'run' || message.type === 'collect') && !this.file) {
+      const file = this.file = message.context.files[0]?.filepath;
+      const parked = file ? this.instances.get(file) : undefined;
+      if (file)
+        this.instances.delete(file);
+      this.host = parked ?? this;
+      void this.runSession(this.host, message, !parked);
+      return;
+    }
     if (!this.ipc) {
       this.emitError(new Error('VS Code extension-host worker is not connected.'));
       return;
@@ -52,25 +87,58 @@ export class VSCodePoolWorker implements PoolWorker {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
-
-    try {
-      await this.connect();
-    } catch (error) {
-      await this.dispose(true);
-      throw error;
-    }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
-  }
+  async start() {} // connect lazily from send(): the run request names the file
 
   async stop() {
-    await this.dispose(false);
+    // Park the cleanly finished instance for this file's next run, watch mode
+    // only; anything else — and anything displaced — is retired.
+    if (this.clean && this.ipc && this.file && this.host && this.options.reuseWorker !== false && this.poolOptions.project.config.watch) {
+      void this.instances.get(this.file)?.dispose(false);
+      this.instances.set(this.file, this.host);
+    } else {
+      await this.host?.dispose(false);
+    }
+  }
+
+  private async runSession(host: VSCodePoolWorker, request: WorkerRequest, fresh: boolean) {
+    try {
+      if (fresh)
+        await this.connect();
+
+      host.events = this.events; // the socket's wiring now feeds this task
+      const { ipc, run } = host;
+      if (!ipc || !run)
+        throw new Error('The VS Code extension-host bridge is not connected.');
+      this.ipc = ipc;
+      // One filtered listener watches the reply stream for the whole session:
+      // it resolves the start gate, and its own removal marks a clean stop.
+      let started: (reply: WorkerResponse) => void = () => {};
+      const gate = new Promise<WorkerResponse>((resolve) => (started = resolve));
+      const onMessage = (message: unknown) => {
+        if (!isWorkerResponse(message))
+          return;
+        if (message.type === 'started')
+          started(message);
+        if (message.type === 'stopped') {
+          this.clean = true;
+          ipc.off('message', onMessage);
+        }
+      };
+      ipc.on('message', onMessage);
+      // Replay "start" and await the real "started" reply before the run
+      // request: the extension host handles the two concurrently.
+      ipc.send(this.startRequest);
+      const reply = await Promise.race([
+        gate,
+        run.then(() => { throw new Error('The VS Code extension host exited.'); }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for the VS Code extension host to start.')), 30_000).unref())
+      ]);
+      if (reply.type === 'started' && reply.error !== undefined)
+        throw reply.error;
+      ipc.send(request);
+    } catch (error) {
+      this.emitError(error);
+    }
   }
 
   private async connect() {
@@ -82,6 +150,11 @@ export class VSCodePoolWorker implements PoolWorker {
     // short (unix socket path limits) and cleaned up on stop.
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    process.once('exit', () => {
+      this.ipc?.destroy(); // the instance exits once its bridge closes
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500); // outlive its final writes
+      if (this.profilePath) { try { rmSync(this.profilePath, { recursive: true, force: true }); } catch {} }
+    });
 
     // Per-worker user-data and extensions dirs go in first: concurrent VS Code
     // instances never share state and nothing lands at the CWD default.
@@ -152,7 +225,7 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
+  async dispose(hard: boolean) {
     this.stopping = true;
 
     try {
