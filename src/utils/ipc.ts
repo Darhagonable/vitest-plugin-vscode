@@ -13,6 +13,11 @@ export class LineIpc extends EventEmitter {
     createInterface({ input: socket }).on('line', (line) => this.emit('message', parse(line)));
   }
 
+  /** True once the socket is destroyed — a dead connection. */
+  get closed(): boolean {
+    return this.socket.destroyed;
+  }
+
   send(message: unknown): void {
     this.socket.write(stringify(message) + '\n');
   }
@@ -23,5 +28,13 @@ export class LineIpc extends EventEmitter {
 
   destroy(): void {
     this.socket.destroy();
+  }
+
+  unref(): void {
+    this.socket.unref();
+  }
+
+  ref(): void {
+    this.socket.ref();
   }
 }

@@ -36,12 +36,13 @@ describe('LineIpc', () => {
     pair.close();
   });
 
-  it('round-trips objects with Dates, Maps, and nested structures', async () => {
-    const sent = {
+  it('round-trips objects with Dates, Maps, cycles, and nested structures', async () => {
+    const sent: Record<string, unknown> = {
       when: new Date('2026-01-01T00:00:00Z'),
       lookup: new Map([['key', 'value']]),
       nested: { list: [1, 2, 3], flag: null }
     };
+    sent.self = sent; // cyclic — JSON cannot carry this, devalue can
     const received = new Promise<unknown>(resolve => pair.a.on('message', resolve));
     pair.b.send(sent);
     await expect(received).resolves.toEqual(sent);
@@ -86,6 +87,7 @@ describe('LineIpc', () => {
     const closed = new Promise<void>(resolve => pair.a.on('close', resolve));
     pair.b.destroy();
     await closed;
+    expect(pair.b.closed).toBe(true);
   });
 
   it('emits close on graceful end', async () => {

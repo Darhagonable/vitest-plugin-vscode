@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
-import { VSCodePoolWorker } from './pool';
+import { VSCodePoolWorker, shutdownWarmConnections } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
 export interface VSCodeOptions {
@@ -105,6 +105,12 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       // inline shim exposing the vscode API to test files
       if (id === 'vscode')
         return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
+    },
+    // Vite server close: fires when vitest's vite server closes, after the
+    // pool is closed. Deterministic cleanup for parked VS Code instances —
+    // awaited so vitest exits only after every instance is gone.
+    closeServer: async () => {
+      await shutdownWarmConnections();
     }
   };
 }
