@@ -1,6 +1,6 @@
 import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -11,24 +11,29 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
-import type { PoolOptions, PoolWorker } from 'vitest/node';
+import type { PoolOptions, PoolWorker, WorkerRequest } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
 
+// Killed forks never run exit hooks; exiting normally re-fires them.
+process.once('SIGTERM', () => process.exit(0));
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
+  private events = new EventEmitter(); // retargeted when a parked host is adopted
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private host: VSCodePoolWorker | undefined;
+  private startMessage: Extract<WorkerRequest, { type: 'start' }> | undefined;
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker>
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -39,41 +44,52 @@ export class VSCodePoolWorker implements PoolWorker {
     this.events.off(event, callback);
   }
 
-  send(message: unknown) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
-      return;
+  send(message: WorkerRequest) {
+    if (message.type === 'start') {
+      // Files arrive only with the run request: answer vitest now, replay in acquire().
+      this.startMessage = message;
+      return this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
     }
-
-    this.ipc.send(message);
+    if (message.type === 'run' || message.type === 'collect')
+      return void this.acquire(message);
+    if (message.type === 'stop') { // normal completion: forced cancels skip it
+      this.events.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+      return; // not forwarded: the host stays warm past its task
+    }
+    this.host?.ipc?.send(message);
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
-
-    try {
-      await this.connect();
-    } catch (error) {
-      await this.dispose(true);
-      throw error;
-    }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
+  async start() {} // the host is picked once the run request names the files
+  async stop() {
+    // cold-boot mode retires the host here (normal stops acked in send)
+    if (this.options.reuseWorker === false) void this.host?.dispose(false);
   }
 
-  async stop() {
-    await this.dispose(false);
+  private async acquire(message: Extract<WorkerRequest, { type: 'run' | 'collect' }>) {
+    const key = JSON.stringify([this.poolOptions.project.name, ...message.context.files.map((file) => file.filepath).sort()]);
+    try {
+      this.host = this.instances.get(key) ?? this; // adopt or become the host
+      if (this.host === this) {
+        if (this.options.reuseWorker !== false) this.instances.set(key, this);
+        await this.connect();
+      }
+      if (this.host !== this) this.host.events = this.events; // route its bridge to this task
+      this.host.ipc?.send(this.startMessage); // its first reply acks the replay
+      await Promise.race([once(this.events, 'message'), new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out starting the extension-host Vitest worker.')), 30_000).unref())]);
+      this.host.ipc?.send(message);
+    } catch (error) {
+      this.instances.delete(key);
+      await (this.host ?? this).dispose(true);
+      this.emitError(error);
+    }
   }
 
   private async connect() {
+    process.once('exit', () => this.dispose(true)); // failed runs never reach closeServer
     const { server, port, connected } = await this.createServer();
     this.server = server;
 
@@ -152,7 +168,7 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
+  async dispose(hard: boolean) {
     this.stopping = true;
 
     try {
@@ -175,7 +191,7 @@ export class VSCodePoolWorker implements PoolWorker {
       this.stopping = false;
 
       if (this.profilePath) {
-        await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
+        rmSync(this.profilePath, { recursive: true, force: true });
         this.profilePath = undefined;
       }
     }
