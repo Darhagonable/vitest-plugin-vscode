@@ -81,6 +81,7 @@ export interface VSCodeOptions {
 }
 
 export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
+  const instances = new Map<string, VSCodePoolWorker>();
   return {
     name: 'vitest-plugin-vscode',
     config: (config) => {
@@ -90,7 +91,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       config.test ??= {};
       config.test.pool = {
         name: 'vscodePool',
-        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
+        createPoolWorker: (poolOptions) => new VSCodePoolWorker(instances, poolOptions, options)
       };
     },
     configResolved: async (resolved) => {
@@ -105,6 +106,11 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       // inline shim exposing the vscode API to test files
       if (id === 'vscode')
         return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
+    },
+    closeServer: async () => {
+      const hosts = [...instances.values()];
+      instances.clear();
+      await Promise.all(hosts.map((host) => host.stop()));
     }
   };
 }
