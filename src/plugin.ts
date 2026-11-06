@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
-import { VSCodePoolWorker, WarmInstances } from './pool';
+import { VSCodePoolWorker, flushParked } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
 export interface VSCodeOptions {
@@ -81,10 +81,6 @@ export interface VSCodeOptions {
 }
 
 export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
-  // Extension hosts parked for watch-mode reuse outlive the task that booted
-  // them; the plugin disposes them all when the Vite server closes.
-  const warm = new WarmInstances();
-
   return {
     name: 'vitest-plugin-vscode',
     config: (config) => {
@@ -94,7 +90,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       config.test ??= {};
       config.test.pool = {
         name: 'vscodePool',
-        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options, warm)
+        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
       };
     },
     configResolved: async (resolved) => {
@@ -110,6 +106,6 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       if (id === 'vscode')
         return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
     },
-    closeServer: () => warm.flush()
+    closeServer: () => flushParked()
   };
 }

@@ -18,28 +18,16 @@ const require = createRequire(import.meta.url);
 
 type RunRequest = { context: { files: { filepath: string }[] } };
 
-/**
- * Watch-mode instance reuse: a worker parks itself by resolving the handoff
- * that the next task for the same files awaits, so a file always reruns in
- * its own extension host.
- */
-export class WarmInstances {
-  private readonly handoffs = new Map<string, Promise<VSCodePoolWorker | undefined>>();
+// Watch-mode reuse: a worker parks itself by resolving the handoff that the
+// next task for the same files awaits.
+const handoffs = new Map<string, Promise<VSCodePoolWorker | undefined>>();
 
-  acquire(key: string) {
-    const previous = this.handoffs.get(key);
-    const handoff = Promise.withResolvers<VSCodePoolWorker | undefined>();
-    this.handoffs.set(key, handoff.promise);
-    return { previous, handoff: handoff.resolve };
-  }
-
-  /** Dispose every parked instance; called when the Vite server closes. */
-  async flush() {
-    await Promise.all([...this.handoffs.values()].map(async (parked) => {
-      const worker = await parked;
-      await worker?.dispose(false).catch(() => undefined);
-    }));
-  }
+/** Dispose every parked extension host; called when the Vite server closes. */
+export async function flushParked() {
+  await Promise.all([...handoffs.values()].map(async (parked) => {
+    const worker = await parked;
+    await worker?.dispose(false).catch(() => undefined);
+  }));
 }
 
 export class VSCodePoolWorker implements PoolWorker {
@@ -54,18 +42,11 @@ export class VSCodePoolWorker implements PoolWorker {
   private handoff: ((worker: VSCodePoolWorker | undefined) => void) | undefined;
   private startMessage: unknown;
   private dead = false;
-  private finished = false;
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions,
-    private readonly warm: WarmInstances
-  ) {
-    this.events.on('message', (message) => {
-      if ((message as { type?: string }).type === 'testfileFinished')
-        this.finished = true;
-    });
-  }
+    private readonly options: VSCodeOptions
+  ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
     this.events.on(event, callback);
@@ -92,8 +73,7 @@ export class VSCodePoolWorker implements PoolWorker {
     }
 
     if (type === 'stop') {
-      // Stay warm between runs of one extension host, like vitest's own
-      // shared (isolate: false) runners, which skip teardown between runs.
+      // Stay warm between runs, like vitest's isolate: false shared runners.
       this.events.emit('message', { type: 'stopped', __vitest_worker_response__: true });
       return;
     }
@@ -112,27 +92,19 @@ export class VSCodePoolWorker implements PoolWorker {
   async stop() {
     const handoff = this.handoff;
     this.handoff = undefined;
-
-    if (!handoff)
-      return;
-
-    const keep = this.options.reuseWorker !== false
-      && this.poolOptions.project.config.watch
-      && this.finished
-      && !this.dead
-      && !!this.ipc;
-
-    handoff(keep ? this : undefined);
-
-    if (!keep)
+    const keep = !!handoff && this.options.reuseWorker !== false
+      && this.poolOptions.project.config.watch && !this.dead && !!this.ipc;
+    handoff?.(keep ? this : undefined);
+    if (handoff && !keep)
       await this.dispose(false);
   }
 
   private async dispatch(request: RunRequest) {
-    const config = this.poolOptions.project.config;
-    const key = `${config.root}\0${request.context.files.map((file) => file.filepath).join()}`;
-    const { previous, handoff } = this.warm.acquire(key);
-    this.handoff = handoff;
+    const key = `${this.poolOptions.project.config.root}\0${request.context.files.map((file) => file.filepath).join()}`;
+    const previous = handoffs.get(key);
+    const next = Promise.withResolvers<VSCodePoolWorker | undefined>();
+    handoffs.set(key, next.promise);
+    this.handoff = next.resolve;
 
     try {
       const parked = await previous;
@@ -153,12 +125,10 @@ export class VSCodePoolWorker implements PoolWorker {
         await this.connect();
         this.run?.catch(() => undefined);
 
-        // Initialize the extension host's run context before the run request,
-        // which would otherwise race its async 'start' handler.
+        // The extension host must complete its 'start' handshake before 'run'.
         const started = once(this.ipc!, 'message');
         this.ipc!.send(this.startMessage);
         const [reply] = await started;
-
         if (reply?.error)
           throw reply.error;
       }
