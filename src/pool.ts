@@ -16,20 +16,24 @@ import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
 
+export const hosts = new Map<string, VSCodeHost>();
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
   private readonly events = new EventEmitter();
-  private server: net.Server | undefined;
+  private host: VSCodeHost | undefined;
   private ipc: LineIpc | undefined;
-  private run: Promise<number> | undefined;
-  private profilePath: string | undefined;
-  private stopping = false;
+  private file: string | undefined;
+  private startRequest: unknown;
+  private clean = false;
 
   constructor(
     private readonly poolOptions: PoolOptions,
     private readonly options: VSCodeOptions
-  ) {}
+  ) {
+    // A listenerless 'error' emit would throw inside the pool process.
+    this.events.on('error', () => {});
+  }
 
   on(event: string, callback: (arg: unknown) => void) {
     this.events.on(event, callback);
@@ -40,8 +44,28 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: unknown) {
+    const request = message as { type?: string; __vitest_worker_request__?: boolean; context?: { files?: { filepath: string }[] } };
+
+    // Answer the start handshake in place of the extension host: the file is
+    // only named by the run request that follows it.
+    if (request?.__vitest_worker_request__ === true && request.type === 'start') {
+      this.startRequest = message;
+      this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
+      return;
+    }
+
+    if ((request?.type === 'run' || request?.type === 'collect') && !this.file) {
+      const file = this.file = request.context?.files?.[0]?.filepath;
+      const parked = file ? hosts.get(file) : undefined;
+      hosts.delete(file!);
+      const host = parked ?? new VSCodeHost(this.poolOptions, this.options);
+      this.host = host;
+      void this.runSession(host, message, !parked);
+      return;
+    }
+
     if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
+      this.events.emit('error', new Error('VS Code extension-host worker is not connected.'));
       return;
     }
 
@@ -53,27 +77,69 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   async start() {
-    if (this.ipc)
-      return;
-
-    try {
-      await this.connect();
-    } catch (error) {
-      await this.dispose(true);
-      throw error;
-    }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
+    // Connect lazily from send(): the run request names this task's file.
   }
 
   async stop() {
-    await this.dispose(false);
+    const { host, ipc } = this;
+    // Park cleanly finished instances for this file's next run, watch mode only.
+    if (host && ipc && this.clean && this.file && this.options.reuseWorker !== false && this.poolOptions.project.config.watch) {
+      hosts.set(this.file, host);
+      // If the socket later closes (a crash), drop the instance so the next
+      // run boots fresh. Teardown empties the map first, so no double-dispose.
+      ipc.once('close', () => {
+        if (hosts.delete(this.file!))
+          void host.dispose();
+      });
+    } else {
+      await host?.dispose();
+    }
   }
 
-  private async connect() {
+  private async runSession(host: VSCodeHost, request: unknown, fresh: boolean) {
+    try {
+      if (fresh)
+        await host.connect();
+
+      // The socket outlives each task; reruns keep adding wiring to it.
+      const ipc = host.ipc!;
+      ipc.setMaxListeners(0);
+      this.ipc = ipc;
+      let started: (error: unknown) => void = () => {};      ipc.on('message', (message: unknown) => {
+        const { type, error } = message as { type?: string; error?: unknown };
+        if (type === 'stopped')
+          this.clean = true;
+        if (type === 'started')
+          started(error);
+        this.events.emit('message', message);
+      });
+      ipc.on('error', (error) => this.events.emit('error', error));
+      ipc.on('close', () => this.events.emit('exit'));
+
+      // Replay "start" and await the real "started" reply before the run
+      // request: the extension host handles both concurrently.
+      ipc.send(this.startRequest);
+      await new Promise((resolve, reject) => (started = (error) => error === undefined ? resolve(null) : reject(error)));
+      ipc.send(request);
+    } catch (error) {
+      hosts.delete(this.file!);
+      this.events.emit('error', error);
+    }
+  }
+}
+
+export class VSCodeHost {
+  private server: net.Server | undefined;
+  private run: Promise<number> | undefined;
+  private profilePath: string | undefined;
+  ipc: LineIpc | undefined;
+
+  constructor(
+    private readonly poolOptions: PoolOptions,
+    private readonly options: VSCodeOptions
+  ) {}
+
+  async connect() {
     const { server, port, connected } = await this.createServer();
     this.server = server;
 
@@ -152,37 +218,24 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
-    this.stopping = true;
+  async dispose() {
+    this.ipc?.destroy();
+    this.server?.close();
 
     try {
-      if (hard) {
-        this.ipc?.destroy();
-      } else {
-        this.ipc?.close();
+      if (this.run) {
         // No timeout: vitest's own teardownTimeout bounds the whole pool.
         await this.run?.then(undefined, (error) => {
           if (!(error instanceof TestRunFailedError))
             throw error;
         });
       }
-
-      this.server?.close();
     } finally {
-      this.ipc = undefined;
-      this.server = undefined;
-      this.run = undefined;
-      this.stopping = false;
-
       if (this.profilePath) {
         await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
         this.profilePath = undefined;
       }
     }
-  }
-
-  canReuse() {
-    return this.options.reuseWorker !== false;
   }
 
   private async createServer() {
@@ -199,12 +252,6 @@ export class VSCodePoolWorker implements PoolWorker {
 
     server.on('connection', (socket) => {
       this.ipc = new LineIpc(socket);
-      this.ipc.on('message', (message) => this.events.emit('message', message));
-      this.ipc.on('error', (error) => this.emitError(error));
-      this.ipc.on('close', () => {
-        if (!this.stopping)
-          this.events.emit('exit');
-      });
     });
 
     return {
@@ -212,11 +259,5 @@ export class VSCodePoolWorker implements PoolWorker {
       port: address.port,
       connected: once(server, 'connection')
     };
-  }
-
-  private emitError(error: unknown) {
-    if (this.events.listenerCount('error') > 0) {
-      this.events.emit('error', error);
-    }
   }
 }
