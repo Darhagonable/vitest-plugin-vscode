@@ -1,5 +1,6 @@
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -26,9 +27,10 @@ export class VSCodePoolWorker implements PoolWorker {
   private stopping = false;
 
   constructor(
+    private readonly instances: Map<string, VSCodePoolWorker>,
     private readonly poolOptions: PoolOptions,
     private readonly options: VSCodeOptions
-  ) {}
+  ) { this.ipc = new LineIpc(new net.Socket()); } // placeholder: vitest's on()/off() land here, never replaced
 
   on(event: string, callback: (arg: unknown) => void) {
     this.ipc?.on(event, callback);
@@ -39,22 +41,27 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: WorkerRequest) {
-    if (!this.ipc)
-      throw new Error('VS Code extension-host worker is not connected.');
-
-    this.ipc.send(message);
+    switch (message.type) {
+      case 'start': // synthetic acks unblock the run request that names the files
+        return void this.ipc?.emit('message', { type: 'started', __vitest_worker_response__: true });
+      case 'run': case 'collect':
+        return void this._start(message.context.files[0].filepath, message).catch((error) => this.ipc?.emit('error', error));
+      case 'stop': // synthetic ack: parked bridges never see the teardown request
+        return void this.ipc?.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+    }
+    return void this.ipc?.emit('rpc', message); // rpc replies reach the adopted bridge via its forwarder
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
+  async start() {} // the placeholder is all vitest's task needs; hosts boot via _boot
 
+  private async _boot() {
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    process.once('exit', () => { if (this.profilePath) rmSync(this.profilePath, { recursive: true, force: true }); });
 
     // User launchArgs append last so they win by ordering.
     const launchArgs: string[] = [];
@@ -159,5 +166,22 @@ export class VSCodePoolWorker implements PoolWorker {
 
   canReuse() {
     return this.options.reuseWorker !== false;
+  }
+
+  private async _start(file: string, request: WorkerRequest) {
+    let host = this.instances.get(file);
+    if (!host) {
+      host = new VSCodePoolWorker(this.instances, this.poolOptions, this.options);
+      this.instances.set(file, host); // claim before the boot: reruns wait on the same host
+      await host._boot();
+      const reply = host.ipc ? once(host.ipc, 'message', { signal: AbortSignal.timeout(30_000) }) : Promise.resolve();
+      host.ipc?.send({ __vitest_worker_request__: true, type: 'start', options: { reportMemory: false }, traces: { enabled: false }, context: { environment: this.poolOptions.environment, config: this.poolOptions.project.serializedConfig } });
+      await reply; // the bridge's first message answers the reconstructed start
+    }
+    host.ipc?.removeAllListeners();
+    host.ipc?.on('exit', () => this.instances.delete(file)); // dead hosts vacate the map
+    for (const event of ['message', 'error', 'exit']) host.ipc?.on(event, (...args: unknown[]) => { if (this.ipc?.listenerCount(event)) this.ipc?.emit(event, ...args); });
+    this.ipc?.on('rpc', (message: unknown) => host.ipc?.send(message));
+    host.ipc?.send(request);
   }
 }
