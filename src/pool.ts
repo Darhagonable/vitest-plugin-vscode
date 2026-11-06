@@ -1,6 +1,7 @@
 import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -19,16 +20,19 @@ const require = createRequire(import.meta.url);
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
+  private events = new EventEmitter();
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private file: string | undefined;
+  private startRequest: WorkerRequest | undefined;
 
   constructor(
     private readonly poolOptions: PoolOptions,
-    private readonly options: VSCodeOptions
+    private readonly options: VSCodeOptions,
+    private readonly instances: Map<string, VSCodePoolWorker>
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
@@ -40,6 +44,22 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: WorkerRequest) {
+    // Acknowledge for the extension host: the file is only named by the run request that follows.
+    if (message.type === 'start') {
+      this.startRequest = message;
+      return this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
+    }
+    // "stop" only follows a normal run: the claimed instance is parked — detach so stop() leaves it warm.
+    if (message.type === 'stop' && this.ipc && this.file && this.options.reuseWorker !== false && this.poolOptions.project.config.watch) {
+      this.ipc = undefined; // the parked instance keeps its bridge
+      return this.events.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+    }
+    if ((message.type === 'run' || message.type === 'collect') && !this.file) {
+      this.file = message.context.files[0].filepath;
+      const host = this.instances.get(this.file) ?? new VSCodePoolWorker(this.poolOptions, this.options, this.instances);
+      this.instances.set(this.file, host); // claim: the entry stays until the next run takes it
+      return void this.runSession(host, message);
+    }
     if (!this.ipc) {
       this.emitError(new Error('VS Code extension-host worker is not connected.'));
       return;
@@ -53,11 +73,16 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   async start() {
+  }
+
+  private async boot() {
     if (this.ipc)
       return;
 
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
+    const sweep = () => { this.ipc?.destroy(); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500); if (this.profilePath) { try { rmSync(this.profilePath, { recursive: true, force: true }); } catch {} } };
+    process.once('exit', sweep); // crash-path cleanup: let the instance exit, then remove its profile
 
     // User launchArgs append last so they win by ordering.
     const launchArgs: string[] = [];
@@ -166,6 +191,24 @@ export class VSCodePoolWorker implements PoolWorker {
       this.profilePath = undefined;
     }
     this.stopping = false;
+  }
+
+  private async runSession(host: VSCodePoolWorker, request: WorkerRequest) {
+    try {
+      if (!host.ipc) await host.boot();
+      host.events = this.events; // the socket's wiring now feeds this task
+      this.ipc = host.ipc;
+      this.ipc?.send(this.startRequest); // the first reply to it is the "started" ack
+      await Promise.race([
+        once(this.events, 'message'),
+        once(this.events, 'exit').then(() => { throw new Error('The VS Code extension host exited.'); }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for the VS Code extension host to start.')), 30_000).unref())
+      ]);
+      this.ipc?.send(request);
+    } catch (error) {
+      if (this.file) this.instances.delete(this.file); // never leave a failed session's instance claimed
+      this.emitError(error);
+    }
   }
 
   canReuse() {
