@@ -16,6 +16,23 @@ import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
 
+type PoolRequest = {
+  __vitest_worker_request__?: boolean;
+  type?: string;
+  context?: { files?: { filepath: string }[] };
+};
+
+// Parked extension hosts (issue #3), keyed by project + test files. With
+// isolate: true vitest discards the pool worker after every task, so the
+// worker that booted a VS Code instance stays registered here and later
+// tasks for the same files forward through it instead of cold-booting.
+const hosts = new Map<string, VSCodePoolWorker>();
+
+function hostKey(poolOptions: PoolOptions, request: PoolRequest): string {
+  const files = (request.context?.files ?? []).map((file) => file.filepath).sort();
+  return JSON.stringify([poolOptions.project.name, ...files]);
+}
+
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
@@ -25,6 +42,12 @@ export class VSCodePoolWorker implements PoolWorker {
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  /** Set when the bridge closed: never adopt a dead host again. */
+  dead = false;
+  private host: VSCodePoolWorker | undefined;
+  // The start handshake arrives before the run request names the files, so
+  // it is held and replayed to the matching host once they are known.
+  private startMessage: unknown;
 
   constructor(
     private readonly poolOptions: PoolOptions,
@@ -40,12 +63,29 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: unknown) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
-      return;
+    const request = message as PoolRequest;
+
+    if (!this.host && request?.__vitest_worker_request__) {
+      switch (request.type) {
+        case 'start':
+          // Only the run/collect request carries the files, so vitest's
+          // handshake is answered here and the real one is replayed to the
+          // matching host once they are known; vitest would block until then.
+          this.startMessage = message;
+          this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
+          return;
+        case 'run':
+        case 'collect':
+          void this.acquire(message);
+          return;
+        case 'stop':
+          // Cancelled before any host was bound: nothing to tear down.
+          this.events.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+          return;
+      }
     }
 
-    this.ipc.send(message);
+    this.host === this ? this.ipc?.send(message) : this.host?.send(message);
   }
 
   deserialize(data: unknown) {
@@ -53,24 +93,67 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   async start() {
-    if (this.ipc)
-      return;
-
-    try {
-      await this.connect();
-    } catch (error) {
-      await this.dispose(true);
-      throw error;
-    }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
+    // Nothing to connect to yet: the host is chosen by the files of the run
+    // request, which vitest only sends after this handshake.
   }
 
   async stop() {
-    await this.dispose(false);
+    // Park: the host stays registered for the next run of the same files.
+    // Cold-boot mode (reuseWorker: false) tears its own host down instead.
+    if (this.host === this && this.options.reuseWorker === false)
+      await this.dispose(false);
+  }
+
+  private async acquire(message: unknown) {
+    const key = hostKey(this.poolOptions, message as PoolRequest);
+
+    try {
+      let host = hosts.get(key);
+
+      if (!host || host.dead) {
+        hosts.set(key, (host = this));
+        await this.connect();
+      }
+
+      this.host = host;
+
+      if (host !== this) {
+        // Forward a parked host's bridge traffic to this task's runner.
+        host.on('message', (m) => this.events.emit('message', m));
+        host.on('exit', () => this.events.emit('exit'));
+        host.on('error', (e) => this.emitError(e));
+      }
+
+      // The run request must not overtake the (asynchronous) worker-side
+      // setup inside the extension host.
+      const started = new Promise<void>((resolve) => {
+        const on = (m: PoolRequest) => {
+          if (m?.type === 'started') {
+            this.events.off('message', on);
+            resolve();
+          }
+        };
+        this.events.on('message', on);
+      });
+
+      this.send(this.startMessage);
+      this.startMessage = undefined;
+      await Promise.race([
+        started,
+        new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error('Timed out waiting for the extension-host Vitest worker to start.'));
+          }, 30_000).unref();
+        })
+      ]);
+      this.send(message);
+    } catch (error) {
+      if (hosts.get(key) === this) {
+        hosts.delete(key);
+        await this.dispose(true);
+      }
+      this.emitError(error);
+    }
   }
 
   private async connect() {
@@ -152,8 +235,9 @@ export class VSCodePoolWorker implements PoolWorker {
     ]);
   }
 
-  private async dispose(hard: boolean) {
+  async dispose(hard: boolean) {
     this.stopping = true;
+    this.dead = true;
 
     try {
       if (hard) {
@@ -202,8 +286,13 @@ export class VSCodePoolWorker implements PoolWorker {
       this.ipc.on('message', (message) => this.events.emit('message', message));
       this.ipc.on('error', (error) => this.emitError(error));
       this.ipc.on('close', () => {
-        if (!this.stopping)
+        this.dead = true;
+        if (!this.stopping) {
           this.events.emit('exit');
+          // A host that died on its own is no longer adoptable; release its
+          // server and profile here, before it gets replaced in the registry.
+          void this.dispose(true);
+        }
       });
     });
 
@@ -219,4 +308,11 @@ export class VSCodePoolWorker implements PoolWorker {
       this.events.emit('error', error);
     }
   }
+}
+
+/** Tears down every parked instance; wired to the vite closeServer hook. */
+export async function disposeHosts() {
+  const warm = [...hosts.values()];
+  hosts.clear();
+  await Promise.all(warm.map((host) => host.dispose(false)));
 }
