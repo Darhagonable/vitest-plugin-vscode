@@ -1,3 +1,4 @@
 node_modules/
 dist/
 .vscode-test/
+tests/_sample-extension/.e2e-host-pid*

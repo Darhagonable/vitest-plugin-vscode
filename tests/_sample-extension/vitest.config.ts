@@ -6,6 +6,7 @@ export default defineConfig({
     vscode({
       version: 'stable',
       launchArgs: ['--log', 'off', '--disable-gpu'],
+      reuseWorker: true,
     })
   ],
   test: {
