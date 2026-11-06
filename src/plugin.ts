@@ -9,6 +9,7 @@ export interface VSCodeOptions extends Partial<Omit<TestOptions, 'extensionTests
 }
 
 export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
+  const instances = new Map<string, VSCodePoolWorker>();
   return {
     name: 'vitest-plugin-vscode',
     config: (config) => {
@@ -18,7 +19,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       config.test ??= {};
       config.test.pool = {
         name: 'vscodePool',
-        createPoolWorker: (poolOptions) => new VSCodePoolWorker(poolOptions, options)
+        createPoolWorker: (poolOptions) => new VSCodePoolWorker(instances, poolOptions, options)
       };
     },
     configResolved: async (resolved) => {

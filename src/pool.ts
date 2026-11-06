@@ -1,6 +1,6 @@
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -20,12 +20,13 @@ export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
   private server: net.Server | undefined;
-  private ipc: LineIpc | undefined;
+  private ipc: LineIpc | undefined = new LineIpc(new net.Socket()); // placeholder: vitest subscribes here before files exist
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
 
   constructor(
+    private readonly instances: Map<string, VSCodePoolWorker>,
     private readonly poolOptions: PoolOptions,
     private readonly options: VSCodeOptions
   ) {}
@@ -39,20 +40,24 @@ export class VSCodePoolWorker implements PoolWorker {
   }
 
   send(message: WorkerRequest) {
-    if (!this.ipc)
-      throw new Error('VS Code extension-host worker is not connected.');
-
-    this.ipc.send(message);
+    switch (message.type) {
+      case 'start': // waitForStart gates the run request — and the file — behind this reply
+        return this.ipc?.emit('message', { type: 'started', __vitest_worker_response__: true });
+      case 'run': case 'collect': return void this._start(message.context.files[0].filepath, message);
+      case 'stop': // teardown waits for this; the parked host must not receive it
+        return this.ipc?.emit('message', { type: 'stopped', __vitest_worker_response__: true });
+      default: return void this.ipc?.emit('out', message); // rpc envelopes, ferried to the host's bridge
+    }
   }
 
   deserialize(data: unknown) {
     return data;
   }
 
-  async start() {
-    if (this.ipc)
-      return;
+  async start() {}
 
+  private async _boot() {
+    process.once('exit', () => this.cleanup());
     const config = this.poolOptions.project.config;
     this.profilePath = path.join(os.tmpdir(), `vsct-${randomUUID().slice(0, 8)}`);
 
@@ -130,28 +135,38 @@ export class VSCodePoolWorker implements PoolWorker {
     }
   }
 
-  async stop() {
-    this.stopping = true;
+  private async _start(file: string, request: WorkerRequest) {
+    const host = this.instances.get(file) ?? new VSCodePoolWorker(this.instances, this.poolOptions, this.options); // adopt or create
+    this.instances.set(file, host);
+    const fresh = !host.server; // captured pre-boot: main's field is the launched marker
     try {
-      this.ipc?.close();
-      await this.run?.catch((error) => {
-        if (!(error instanceof TestRunFailedError))
-          throw error;
-      });
-    } finally {
-      await this.cleanup();
+      if (fresh) await host._boot();
+      for (const event of ['message', 'error', 'exit']) host.ipc?.on(event, (...args) => this.ipc?.emit(event, ...args));
+      this.ipc?.on('out', (message: unknown) => host.ipc?.send(message)); // ferries send()'s default traffic to the EH
+      if (fresh) {
+        host.ipc?.send({ type: 'start', poolId: 1, workerId: 1, __vitest_worker_request__: true, options: { reportMemory: false }, context: { environment: this.poolOptions.environment, config: this.poolOptions.project.serializedConfig, pool: 'vscodePool' }, traces: { enabled: false } }); // reconstructed: poolId/workerId only label env vars; setup rides config+environment
+        await Promise.race([new Promise((resolve) => this.ipc?.once('message', resolve)), new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out starting the extension-host Vitest worker.')), 30_000).unref())]);
+      }
+      host.ipc?.send(request);
+    } catch (error) {
+      this.instances.delete(file);
+      this.ipc?.emit('error', error);
     }
   }
+  async stop() {} // parking: the placeholder must not close — its 'exit' would fail vitest's runner
 
-  private async cleanup() {
+
+  async cleanup() { // public: shared by the exit hook and the plugin's closeServer
     this.stopping = true;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000); // outlive the dying child's final profile writes
     this.ipc?.destroy();
     this.server?.close();
     this.ipc = undefined;
     this.server = undefined;
     this.run = undefined;
     if (this.profilePath) {
-      await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000); // outlive the dying child's final writes
+      rmSync(this.profilePath, { recursive: true, force: true });
       this.profilePath = undefined;
     }
     this.stopping = false;
