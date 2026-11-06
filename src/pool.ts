@@ -16,15 +16,17 @@ import type { VSCodeOptions } from './plugin';
 
 const require = createRequire(import.meta.url);
 
+export const hosts = new Map<string, VSCodeHost>();
+
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
   private readonly events = new EventEmitter();
-  private server: net.Server | undefined;
+  private host: VSCodeHost | undefined;
   private ipc: LineIpc | undefined;
-  private run: Promise<number> | undefined;
-  private profilePath: string | undefined;
-  private stopping = false;
+  private file: string | undefined;
+  private startRequest: unknown;
+  private clean = false;
 
   constructor(
     private readonly poolOptions: PoolOptions,
@@ -39,7 +41,32 @@ export class VSCodePoolWorker implements PoolWorker {
     this.events.off(event, callback);
   }
 
+  deserialize(data: unknown) {
+    return data;
+  }
+
+  async start() {
+    // Connect lazily from send(): the file this task runs is only named by
+    // the run request, which vitest sends after a "started" reply.
+  }
+
   send(message: unknown) {
+    const request = message as { type?: string; __vitest_worker_request__?: boolean };
+
+    // Answer the start handshake in place of the extension host: the file
+    // this task runs is only named by the run request that follows it.
+    if (request?.__vitest_worker_request__ === true && request.type === 'start') {
+      this.startRequest = message;
+      this.events.emit('message', { type: 'started', __vitest_worker_response__: true });
+      return;
+    }
+
+    // A runner kept alive by `isolate: false` reuses its open session.
+    if ((request?.type === 'run' || request?.type === 'collect') && !this.file) {
+      this.openSession(message);
+      return;
+    }
+
     if (!this.ipc) {
       this.emitError(new Error('VS Code extension-host worker is not connected.'));
       return;
@@ -48,33 +75,87 @@ export class VSCodePoolWorker implements PoolWorker {
     this.ipc.send(message);
   }
 
-  deserialize(data: unknown) {
-    return data;
-  }
-
-  async start() {
-    if (this.ipc)
-      return;
-
-    try {
-      await this.connect();
-    } catch (error) {
-      await this.dispose(true);
-      throw error;
-    }
-
-    this.run?.catch((error) => {
-      if (!this.stopping)
-        this.emitError(error);
-    });
-  }
-
   async stop() {
-    await this.dispose(false);
+    const host = this.host;
+    this.host = undefined;
+    this.ipc?.close();
+
+    // Park cleanly finished instances for this file's next run, in watch
+    // mode only; anything else retires them.
+    if (host && this.clean && this.file && this.options.reuseWorker !== false && this.poolOptions.project.config.watch) {
+      hosts.set(this.file, host);
+    } else {
+      await host?.dispose();
+    }
   }
 
-  private async connect() {
-    const { server, port, connected } = await this.createServer();
+  private openSession(request: unknown) {
+    const file = (request as { context?: { files?: { filepath: string }[] } }).context?.files?.[0]?.filepath;
+    this.file = file;
+    const parked = file ? hosts.get(file) : undefined;
+    hosts.delete(file!);
+    const host = parked ?? new VSCodeHost(this.poolOptions, this.options);
+    this.host = host;
+    void this.runSession(host, request, !parked);
+  }
+
+  private async runSession(host: VSCodeHost, request: unknown, fresh: boolean) {
+    try {
+      if (fresh)
+        await host.connect();
+
+      const ipc = await host.nextSession();
+
+      this.ipc = ipc;
+      ipc.on('message', (message: unknown) => {
+        if ((message as { type?: string })?.type === 'stopped')
+          this.clean = true;
+        this.events.emit('message', message);
+      });
+      ipc.on('error', (error) => this.emitError(error));
+      ipc.on('close', () => this.events.emit('exit'));
+
+      // Replay "start" and await the real "started" reply before the run
+      // request: the extension host handles both concurrently.
+      ipc.send(this.startRequest);
+      await new Promise((resolve, reject) => {
+        const onMessage = (message: { type?: string; error?: unknown }) => {
+          if (message?.type !== 'started')
+            return;
+          ipc.off('message', onMessage);
+          message.error === undefined ? resolve(null) : reject(message.error);
+        };
+        ipc.on('message', onMessage);
+      });
+      ipc.send(request);
+    } catch (error) {
+      hosts.delete(this.file!);
+      this.emitError(error);
+    }
+  }
+
+  private emitError(error: unknown) {
+    if (this.events.listenerCount('error') > 0) {
+      this.events.emit('error', error);
+    }
+  }
+}
+
+/** A VS Code instance kept alive for the reruns of a single test file. */
+export class VSCodeHost {
+  private readonly sessions = new EventEmitter();
+  private server: net.Server | undefined;
+  private ipc: LineIpc | undefined;
+  private run: Promise<number> | undefined;
+  private profilePath: string | undefined;
+
+  constructor(
+    private readonly poolOptions: PoolOptions,
+    private readonly options: VSCodeOptions
+  ) {}
+
+  async connect() {
+    const { server, port } = await this.createServer();
     this.server = server;
 
     // Anchor the download cache at the project root so nothing leaks outside
@@ -126,63 +207,41 @@ export class VSCodePoolWorker implements PoolWorker {
       launchArgs,
       reporter: new SilentReporter()
     });
-    let bridgeConnected = false;
-    const connectedBeforeExit = connected.then(() => {
-      bridgeConnected = true;
-    });
-    const exitedBeforeConnect = this.run.then(
-      () => {
-        if (!bridgeConnected)
-          throw new Error('VS Code exited before the extension-host Vitest bridge connected.');
-      },
-      (error) => {
-        if (!bridgeConnected)
-          throw error;
-      }
-    );
-
-    await Promise.race([
-      connectedBeforeExit,
-      exitedBeforeConnect,
-      new Promise((_, reject) => {
-        setTimeout(() => {
-          reject(new Error('Timed out waiting for the VS Code extension-host Vitest bridge to connect.'));
-        }, config.inspector.waitForDebugger ? 300_000 : 30_000).unref();
-      })
-    ]);
   }
 
-  private async dispose(hard: boolean) {
-    this.stopping = true;
+  /** Claim the next session socket; rejects when VS Code exits first. */
+  async nextSession(): Promise<LineIpc> {
+    if (!this.ipc) {
+      const timeout = this.poolOptions.project.config.inspector.waitForDebugger ? 300_000 : 30_000;
+
+      await Promise.race([
+        once(this.sessions, 'session'),
+        this.run!.then(() => { throw new Error('The VS Code extension host exited.'); }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for the VS Code extension-host Vitest bridge to connect.')), timeout).unref())
+      ]);
+    }
+
+    const ipc = this.ipc!;
+    this.ipc = undefined;
+    return ipc;
+  }
+
+  async dispose() {
+    this.ipc?.destroy();
+    this.server?.close();
 
     try {
-      if (hard) {
-        this.ipc?.destroy();
-      } else {
-        this.ipc?.close();
-        // No timeout: vitest's own teardownTimeout bounds the whole pool.
-        await this.run?.then(undefined, (error) => {
-          if (!(error instanceof TestRunFailedError))
-            throw error;
-        });
-      }
-
-      this.server?.close();
+      // No timeout: vitest's own teardownTimeout bounds the whole pool.
+      await this.run?.then(undefined, (error) => {
+        if (!(error instanceof TestRunFailedError))
+          throw error;
+      });
     } finally {
-      this.ipc = undefined;
-      this.server = undefined;
-      this.run = undefined;
-      this.stopping = false;
-
       if (this.profilePath) {
         await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
         this.profilePath = undefined;
       }
     }
-  }
-
-  canReuse() {
-    return this.options.reuseWorker !== false;
   }
 
   private async createServer() {
@@ -199,24 +258,9 @@ export class VSCodePoolWorker implements PoolWorker {
 
     server.on('connection', (socket) => {
       this.ipc = new LineIpc(socket);
-      this.ipc.on('message', (message) => this.events.emit('message', message));
-      this.ipc.on('error', (error) => this.emitError(error));
-      this.ipc.on('close', () => {
-        if (!this.stopping)
-          this.events.emit('exit');
-      });
+      this.sessions.emit('session', this.ipc);
     });
 
-    return {
-      server,
-      port: address.port,
-      connected: once(server, 'connection')
-    };
-  }
-
-  private emitError(error: unknown) {
-    if (this.events.listenerCount('error') > 0) {
-      this.events.emit('error', error);
-    }
+    return { server, port: address.port };
   }
 }

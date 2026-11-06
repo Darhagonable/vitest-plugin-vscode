@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { Plugin } from 'vitest/config';
 import { downloadAndUnzipVSCode, type DownloadOptions, type TestOptions } from '@vscode/test-electron';
 import type { DownloadPlatform, DownloadVersion } from '@vscode/test-electron/out/download.js';
-import { VSCodePoolWorker } from './pool';
+import { hosts, VSCodePoolWorker } from './pool';
 
 /** Matching {@link TestOptions} and {@link DownloadOptions}. */
 export interface VSCodeOptions {
@@ -46,8 +46,8 @@ export interface VSCodeOptions {
   vscodeExecutablePath?: string;
   /**
    * Whether VS Code should be launched using default settings and extensions
-   * installed on this machine. If `false`, then separate directories will
-   * be used inside the `.vscode-test` folder within the project.
+   * installed on this machine. If `false`, then separate directories will be
+   * used inside the `.vscode-test` folder within the project.
    *
    * Defaults to `false`.
    */
@@ -76,7 +76,7 @@ export interface VSCodeOptions {
    * timeout and does not enforce the total time VS Code may take to download.
    */
   timeout?: number;
-  /** Keep VS Code instances warm between test runs (watch mode). */
+  /** Keep each test file's VS Code instance warm between watch-mode reruns. */
   reuseWorker?: boolean;
 }
 
@@ -105,6 +105,7 @@ export function vscodePlugin(options: VSCodeOptions = {}): Plugin {
       // inline shim exposing the vscode API to test files
       if (id === 'vscode')
         return `data:text/javascript,${encodeURIComponent('export * from "vscode";')}`;
-    }
+    },
+    closeServer: async () => { await Promise.all([...hosts.values()].map((host) => host.dispose())); hosts.clear(); }
   };
 }

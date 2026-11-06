@@ -10,9 +10,18 @@ export async function run() {
   if (!Number.isInteger(port) || port <= 0)
     throw new Error('Missing VITEST_RUNNER_IPC_PORT for Vitest VS Code bridge.');
 
-  const ipc = new LineIpc(net.connect({ host, port }));
-  await once(ipc, 'connect');
+  // Serve one session per pool task, reconnecting after every run to keep
+  // the extension host alive. A refused connection (the pool closed its
+  // server) rejects and retires this instance.
+  for (;;) {
+    const ipc = new LineIpc(net.connect({ host, port }));
+    await once(ipc, 'connect');
 
+    await once(serve(ipc), 'close').catch(() => {});
+  }
+}
+
+function serve(ipc: LineIpc) {
   init({
     on: (callback) => ipc.on('message', callback),
     off: (callback) => ipc.off('message', callback),
@@ -21,7 +30,5 @@ export async function run() {
     runTests: (state, traces) => runBaseTests('run', state, traces),
     collectTests: (state, traces) => runBaseTests('collect', state, traces)
   });
-
-  await once(ipc, 'close');
+  return ipc;
 }
-
