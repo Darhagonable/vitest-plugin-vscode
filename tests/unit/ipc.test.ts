@@ -82,14 +82,14 @@ describe('LineIpc', () => {
     await expect(gotB).resolves.toEqual({ from: 'a' });
   });
 
-  it('emits close when the other end destroys the socket', async () => {
-    const closed = new Promise<void>(resolve => pair.a.on('close', resolve));
+  it('emits exit when the other end destroys the socket', async () => {
+    const closed = new Promise<void>(resolve => pair.a.on('exit', resolve));
     pair.b.destroy();
     await closed;
   });
 
-  it('emits close on graceful end', async () => {
-    const closed = new Promise<void>(resolve => pair.a.on('close', resolve));
+  it('emits exit on graceful end', async () => {
+    const closed = new Promise<void>(resolve => pair.a.on('exit', resolve));
     pair.b.close();
     await closed;
   });

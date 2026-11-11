@@ -1,4 +1,4 @@
-import { EventEmitter, once } from 'node:events';
+import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
@@ -19,7 +19,6 @@ const require = createRequire(import.meta.url);
 export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
-  private readonly events = new EventEmitter();
   private server: net.Server | undefined;
   private ipc: LineIpc | undefined;
   private run: Promise<number> | undefined;
@@ -32,18 +31,16 @@ export class VSCodePoolWorker implements PoolWorker {
   ) {}
 
   on(event: string, callback: (arg: unknown) => void) {
-    this.events.on(event, callback);
+    this.ipc?.on(event, callback);
   }
 
   off(event: string, callback: (arg: unknown) => void) {
-    this.events.off(event, callback);
+    this.ipc?.off(event, callback);
   }
 
   send(message: WorkerRequest) {
-    if (!this.ipc) {
-      this.emitError(new Error('VS Code extension-host worker is not connected.'));
-      return;
-    }
+    if (!this.ipc)
+      throw new Error('VS Code extension-host worker is not connected.');
 
     this.ipc.send(message);
   }
@@ -83,26 +80,15 @@ export class VSCodePoolWorker implements PoolWorker {
     delete process.env.ELECTRON_RUN_AS_NODE;
 
     try {
-      const server = net.createServer((socket) => {
+      this.server = net.createServer((socket) => {
         this.ipc = new LineIpc(socket);
-        this.ipc.on('message', (message) => this.events.emit('message', message));
-        this.ipc.on('error', (error) => this.emitError(error));
-        this.ipc.on('close', () => {
-          if (!this.stopping)
-            this.events.emit('exit');
-        });
       });
 
-      server.listen(0, '127.0.0.1');
-      await once(server, 'listening');
-      this.server = server;
+      await once(this.server.listen(0, '127.0.0.1'), 'listening');
+      const address = this.server.address();
 
-      const address = server.address();
-
-      if (!address || typeof address === 'string') {
-        server.close();
+      if (!address || typeof address === 'string')
         throw new Error('Could not allocate IPC port for VS Code Vitest worker.');
-      }
 
       this.run = runTests({
         vscodeExecutablePath: this.options.vscodeExecutablePath,
@@ -120,7 +106,7 @@ export class VSCodePoolWorker implements PoolWorker {
       });
 
       await Promise.race([
-        once(server, 'connection'),
+        once(this.server, 'connection'),
         this.run.then(() => {
           throw new Error('VS Code exited before the extension-host Vitest bridge connected.');
         }),
@@ -133,7 +119,7 @@ export class VSCodePoolWorker implements PoolWorker {
 
       this.run.catch((error) => {
         if (!this.stopping)
-          this.emitError(error);
+          this.ipc?.emit('error', error);
       });
     } catch (error) {
       await this.cleanup();
@@ -170,11 +156,5 @@ export class VSCodePoolWorker implements PoolWorker {
 
   canReuse() {
     return this.options.reuseWorker !== false;
-  }
-
-  private emitError(error: unknown) {
-    if (this.events.listenerCount('error') > 0) {
-      this.events.emit('error', error);
-    }
   }
 }

@@ -22,6 +22,6 @@ export async function run() {
     collectTests: (state, traces) => runBaseTests('collect', state, traces)
   });
 
-  await once(ipc, 'close');
+  await once(ipc, 'exit');
 }
 
