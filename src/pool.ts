@@ -98,9 +98,12 @@ export class VSCodePoolWorker implements PoolWorker {
         extensionTestsPath: require.resolve('./vscode-worker.mjs'),
         reuseMachineInstall: this.options.reuseMachineInstall,
         extensionTestsEnv: {
+          ...this.options.extensionTestsEnv,
           VITEST_RUNNER_IPC_HOST: '127.0.0.1',
           VITEST_RUNNER_IPC_PORT: String(address.port)
         },
+        stdout: this.options.stdout,
+        stderr: this.options.stderr,
         launchArgs: launchArgs,
         reporter: new SilentReporter()
       });
