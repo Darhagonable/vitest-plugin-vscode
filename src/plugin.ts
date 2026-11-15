@@ -4,7 +4,12 @@ import { downloadAndUnzipVSCode, type TestOptions } from '@vscode/test-electron'
 import { VSCodePoolWorker } from './pool';
 
 export interface VSCodeOptions extends Partial<Omit<TestOptions, 'extensionTestsPath'>> {
-  /** Keep VS Code instances warm between test runs (watch mode). */
+  /**
+   * Allow Vitest to reuse the extension-host worker across test files.
+   * Effective with vitest's `isolate: false`.
+   *
+   * Defaults to `true`.
+   */
   reuseWorker?: boolean;
 }
 
