@@ -44,7 +44,8 @@
   ],
   "dependencies": {
     "@vscode/test-electron": "^3.0.0",
-    "devalue": "^6.0.0"
+    "devalue": "^6.0.0",
+    "xvfb-ts": "^1.1.1"
   },
   "peerDependencies": {
     "vitest": ">=5.0.0"

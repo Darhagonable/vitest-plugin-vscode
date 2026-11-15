@@ -11,6 +11,7 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
+import { withXvfb } from './utils/xvfb';
 import type { PoolOptions, PoolWorker, WorkerRequest } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
@@ -90,7 +91,7 @@ export class VSCodePoolWorker implements PoolWorker {
       if (!address || typeof address === 'string')
         throw new Error('Could not allocate IPC port for VS Code Vitest worker.');
 
-      this.run = runTests({
+      this.run = withXvfb((display) => runTests({
         vscodeExecutablePath: this.options.vscodeExecutablePath,
         version: process.env.VSCODE_VERSION ?? this.options.version,
         cachePath: this.options.cachePath,
@@ -99,6 +100,7 @@ export class VSCodePoolWorker implements PoolWorker {
         reuseMachineInstall: this.options.reuseMachineInstall,
         extensionTestsEnv: {
           ...this.options.extensionTestsEnv,
+          ...(display ? { DISPLAY: display } : undefined),
           VITEST_RUNNER_IPC_HOST: '127.0.0.1',
           VITEST_RUNNER_IPC_PORT: String(address.port)
         },
@@ -106,7 +108,7 @@ export class VSCodePoolWorker implements PoolWorker {
         stderr: this.options.stderr,
         launchArgs: launchArgs,
         reporter: new SilentReporter()
-      });
+      }));
 
       await Promise.race([
         once(this.server, 'connection'),

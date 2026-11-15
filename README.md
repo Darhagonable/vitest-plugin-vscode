@@ -126,10 +126,10 @@ jobs:
                   VSCODE_VERSION: ${{ matrix.vscode-version }}
 ```
 
-On headless Linux runners, Electron needs a D-Bus session and a display. Launch through `dbus-run-session` and `xvfb-run`:
+On headless Linux runners, the pool starts its own Xvfb automatically, so `npm test` works as-is on GitHub's ubuntu runners. Xvfb is the only prerequisite there:
 
 ```bash
-dbus-run-session -- xvfb-run pnpm test
+apt-get install xvfb
 ```
 
 The first run downloads a ~350 MB VS Code build into `cachePath` (`.vscode-test` by default). Cache that directory between runs.
