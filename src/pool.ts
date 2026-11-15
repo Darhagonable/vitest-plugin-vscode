@@ -11,7 +11,6 @@ import {
   TestRunFailedError
 } from '@vscode/test-electron';
 import { LineIpc } from './utils/ipc';
-import { withXvfb } from './utils/xvfb';
 import type { PoolOptions, PoolWorker, WorkerRequest } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
@@ -68,6 +67,11 @@ export class VSCodePoolWorker implements PoolWorker {
       );
     }
 
+    // Electron's headless display backend removes the need for an X server
+    // on displayless Linux.
+    if (process.platform === 'linux' && !process.env.DISPLAY)
+      launchArgs.push('--ozone-platform=headless');
+
     if (config.inspector.enabled)
       launchArgs.push(config.inspector.waitForDebugger
         ? `--inspect-brk-extensions=${config.inspector.port ?? 9229}`
@@ -91,7 +95,7 @@ export class VSCodePoolWorker implements PoolWorker {
       if (!address || typeof address === 'string')
         throw new Error('Could not allocate IPC port for VS Code Vitest worker.');
 
-      this.run = withXvfb((display) => runTests({
+      this.run = runTests({
         vscodeExecutablePath: this.options.vscodeExecutablePath,
         version: process.env.VSCODE_VERSION ?? this.options.version,
         cachePath: this.options.cachePath,
@@ -100,7 +104,6 @@ export class VSCodePoolWorker implements PoolWorker {
         reuseMachineInstall: this.options.reuseMachineInstall,
         extensionTestsEnv: {
           ...this.options.extensionTestsEnv,
-          ...(display ? { DISPLAY: display } : undefined),
           VITEST_RUNNER_IPC_HOST: '127.0.0.1',
           VITEST_RUNNER_IPC_PORT: String(address.port)
         },
@@ -108,7 +111,7 @@ export class VSCodePoolWorker implements PoolWorker {
         stderr: this.options.stderr,
         launchArgs: launchArgs,
         reporter: new SilentReporter()
-      }));
+      });
 
       await Promise.race([
         once(this.server, 'connection'),

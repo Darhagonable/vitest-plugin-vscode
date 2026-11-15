@@ -14,9 +14,6 @@ importers:
       devalue:
         specifier: ^6.0.0
         version: 6.0.3
-      xvfb-ts:
-        specifier: ^1.1.1
-        version: 1.1.1
     devDependencies:
       '@types/node':
         specifier: ^26.0.0
@@ -720,10 +717,6 @@ packages:
     engines: {node: '>=20.11'}
     hasBin: true
 
-  xvfb-ts@1.1.1:
-    resolution: {integrity: sha512-5LWBLqKlneQMSKVh4QPkuCo+/u3Z0I8E8VdJHgeiDL1Jg3mgQbcCv3FksAJyl4b5wcfW6pvcxaYPOA1Q773ZIA==}
-    engines: {node: '>=20.17.0'}
-
   yuku@0.25.0:
     resolution: {integrity: sha512-iAlHlpPmcjRqUauDkW9xF33b+jsUzTrrv49FfPLBNxEAUWuU7XN8tBUGjBHYPCEF/d3632MhG6GjCZutecA8Ng==}
     engines: {node: '>=16.4.0'}
@@ -1209,8 +1202,6 @@ snapshots:
       - msw
 
   why-is-node-running@3.2.1: {}
-
-  xvfb-ts@1.1.1: {}
 
   yuku@0.25.0:
     optionalDependencies:

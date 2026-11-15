@@ -126,11 +126,7 @@ jobs:
                   VSCODE_VERSION: ${{ matrix.vscode-version }}
 ```
 
-On headless Linux runners, the pool starts its own Xvfb automatically, so `npm test` works as-is on GitHub's ubuntu runners. Xvfb is the only prerequisite there:
-
-```bash
-apt-get install xvfb
-```
+On headless Linux, VS Code launches with Electron's headless display backend, so `npm test` works as-is with nothing to install.
 
 The first run downloads a ~350 MB VS Code build into `cachePath` (`.vscode-test` by default). Cache that directory between runs.
 
