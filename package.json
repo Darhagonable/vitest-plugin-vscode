@@ -57,7 +57,7 @@
     "vitest": "^5.0.0"
   },
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && pnpm -F sample-extension build",
     "typecheck": "tsc",
     "test": "vitest run",
     "test:sample-extension": "vitest run --root tests/_sample-extension"

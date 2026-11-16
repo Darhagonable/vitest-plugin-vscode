@@ -1,5 +1,6 @@
 {
   "name": "sample-extension",
+  "publisher": "vitest-plugin-vscode",
   "displayName": "Sample Extension",
   "description": "Fixture VS Code extension used as the dev-extension host for the runner's own test suite.",
   "version": "0.0.0",
@@ -8,7 +9,20 @@
     "vscode": "^1.120.0"
   },
   "type": "module",
+  "main": "./dist/extension.cjs",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sample-extension.helloWorld",
+        "title": "Hello World"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsdown src/extension.ts --format cjs"
+  },
   "devDependencies": {
+    "tsdown": "^0.23.0",
     "vitest-plugin-vscode": "workspace:*"
   }
 }

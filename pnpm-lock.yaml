@@ -33,6 +33,9 @@ importers:
 
   tests/_sample-extension:
     devDependencies:
+      tsdown:
+        specifier: ^0.23.0
+        version: 0.23.5(typescript@6.0.3)
       vitest-plugin-vscode:
         specifier: workspace:*
         version: link:../..

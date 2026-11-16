@@ -1,28 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { once } from 'node:events';
 import * as net from 'node:net';
 import { Ipc } from '../../src/utils/ipc';
 
-function createSocketPair(): Promise<{ a: Ipc; b: Ipc; close: () => void }> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.listen(0, '127.0.0.1', () => {
-      const { port } = server.address() as net.AddressInfo;
-      const socket = net.connect({ host: '127.0.0.1', port });
-      socket.on('error', reject);
-      server.once('connection', connection => {
-        resolve({
-          a: new Ipc(connection),
-          b: new Ipc(socket),
-          close: () => {
-            connection.destroy();
-            socket.destroy();
-            server.close();
-          }
-        });
-      });
-    });
-    server.on('error', reject);
-  });
+async function createSocketPair() {
+  const server = net.createServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  const address = server.address();
+
+  if (!address || typeof address === 'string')
+    throw new Error('Could not allocate a port for the IPC test pair.');
+
+  const socket = net.connect({ host: '127.0.0.1', port: address.port });
+  const [connection] = await once(server, 'connection');
+
+  return {
+    a: new Ipc(connection),
+    b: new Ipc(socket),
+    close: () => {
+      connection.destroy();
+      socket.destroy();
+      server.close();
+    }
+  };
 }
 
 describe('Ipc', () => {
@@ -42,15 +44,15 @@ describe('Ipc', () => {
       lookup: new Map([['key', 'value']]),
       nested: { list: [1, 2, 3], flag: null }
     };
-    const received = new Promise<unknown>(resolve => pair.a.on('message', resolve));
+    const received = new Promise((resolve) => pair.a.on('message', resolve));
     pair.b.send(sent);
     await expect(received).resolves.toEqual(sent);
   });
 
   it('delivers messages in send order', async () => {
     const received: unknown[] = [];
-    const all = new Promise<void>(resolve => {
-      pair.a.on('message', (message: unknown) => {
+    const all = new Promise<void>((resolve) => {
+      pair.a.on('message', (message) => {
         received.push(message);
         if (received.length === 10) resolve();
       });
@@ -66,14 +68,14 @@ describe('Ipc', () => {
 
   it('reassembles a large message fragmented across TCP chunks', async () => {
     const big = { data: 'x'.repeat(1024 * 1024) };
-    const received = new Promise<unknown>(resolve => pair.a.on('message', resolve));
+    const received = new Promise((resolve) => pair.a.on('message', resolve));
     pair.b.send(big);
     await expect(received).resolves.toEqual(big);
   });
 
   it('carries messages in both directions simultaneously', async () => {
-    const gotA = new Promise<unknown>(resolve => pair.a.on('message', resolve));
-    const gotB = new Promise<unknown>(resolve => pair.b.on('message', resolve));
+    const gotA = new Promise((resolve) => pair.a.on('message', resolve));
+    const gotB = new Promise((resolve) => pair.b.on('message', resolve));
 
     pair.b.send({ from: 'b' });
     pair.a.send({ from: 'a' });
@@ -83,13 +85,13 @@ describe('Ipc', () => {
   });
 
   it('emits exit when the other end destroys the socket', async () => {
-    const closed = new Promise<void>(resolve => pair.a.on('exit', resolve));
+    const closed = new Promise((resolve) => pair.a.on('exit', resolve));
     pair.b.destroy();
     await closed;
   });
 
   it('emits exit on graceful end', async () => {
-    const closed = new Promise<void>(resolve => pair.a.on('exit', resolve));
+    const closed = new Promise((resolve) => pair.a.on('exit', resolve));
     pair.b.close();
     await closed;
   });

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { describe, expect, it } from 'vitest';
-import { activate } from '../src/extension';
+import { commandId } from '../src/extension';
 
 describe('vscode API', () => {
   it('exposes the extension host API', () => {
@@ -20,19 +20,17 @@ describe('vscode API', () => {
 });
 
 describe('sample extension', () => {
-  it('can be imported and activated directly from source', () => {
-    const subscriptions: vscode.Disposable[] = [];
-    activate({ subscriptions } as unknown as vscode.ExtensionContext);
-    expect(subscriptions).toHaveLength(1);
-    subscriptions.forEach(disposable => disposable.dispose());
+  it('is activated by VS Code', async () => {
+    const extension = vscode.extensions.getExtension('vitest-plugin-vscode.sample-extension');
+
+    if (!extension)
+      throw new Error('sample extension not found');
+
+    await extension.activate();
+    expect(extension.isActive).toBe(true);
   });
 
-  it('registers and executes a command', async () => {
-    const subscriptions: vscode.Disposable[] = [];
-    activate({ subscriptions } as unknown as vscode.ExtensionContext);
-
-    await expect(vscode.commands.executeCommand('sample-extension.helloWorld')).resolves.toBeUndefined();
-
-    subscriptions.forEach(disposable => disposable.dispose());
+  it('registers and executes its command', async () => {
+    await expect(vscode.commands.executeCommand(commandId)).resolves.toBeUndefined();
   });
 });

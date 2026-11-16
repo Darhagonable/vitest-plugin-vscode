@@ -18,13 +18,13 @@ const sampleRoot = join(process.cwd(), 'tests/_sample-extension');
 // The only watch side channel: resolves when the current run ends.
 let resolveRunEnd: (() => void) | undefined;
 const reporter: Reporter = { onTestRunEnd: () => resolveRunEnd?.() };
-const awaitNextRun = () => new Promise<void>(resolve => (resolveRunEnd = resolve));
+const awaitNextRun = () => new Promise<void>((resolve) => (resolveRunEnd = resolve));
 
 let ctx: Vitest | undefined;
 
 const findTest = (moduleFragment: string, testFragment: string) =>
-  ctx?.state.getTestModules().find(m => m.moduleId.includes(moduleFragment))
-    ?.children.allTests().find(t => t.name.includes(testFragment));
+  ctx?.state.getTestModules().find((m) => m.moduleId.includes(moduleFragment))
+    ?.children.allTests().find((t) => t.name.includes(testFragment));
 
 beforeAll(async () => {
   // Reset possible previous runs, like Vitest's own test harness does; the
@@ -52,12 +52,12 @@ describe('vscode extension-host pool', () => {
     expect(findTest('vscode-api-pass', 'exposes the extension host API')?.ok()).toBe(true);
   });
 
-  it('activates the extension directly from source', () => {
-    expect(findTest('vscode-api-pass', 'activated directly from source')?.ok()).toBe(true);
+  it('activates the extension with a real context', () => {
+    expect(findTest('vscode-api-pass', 'is activated by VS Code')?.ok()).toBe(true);
   });
 
   it('registers and executes commands', () => {
-    expect(findTest('vscode-api-pass', 'registers and executes a command')?.ok()).toBe(true);
+    expect(findTest('vscode-api-pass', 'registers and executes its command')?.ok()).toBe(true);
   });
 
   it('reports failing sample tests as failed', () => {
@@ -77,7 +77,7 @@ describe('vscode extension-host pool', () => {
   });
 
   it('forwards console output from the extension host', () => {
-    const logs = findTest('vscode-api-pass', 'forwards console output')?.logs().map(log => log.content).join('');
+    const logs = findTest('vscode-api-pass', 'forwards console output')?.logs().map((log) => log.content).join('');
     expect(logs).toContain('e2e: console forwarded from the extension host');
   });
 
@@ -93,6 +93,6 @@ describe('vscode extension-host pool', () => {
     await writeFile(join(sampleRoot, 'src/extension.ts'), `${source}\n// e2e: dependency rerun marker\n`);
     await rerunEnded;
 
-    expect(findTest('vscode-api-pass', 'registers and executes a command')?.ok()).toBe(true);
+    expect(findTest('vscode-api-pass', 'registers and executes its command')?.ok()).toBe(true);
   });
 });
