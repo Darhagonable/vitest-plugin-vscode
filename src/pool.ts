@@ -1,4 +1,5 @@
 import { once } from 'node:events';
+import { setTimeout } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
@@ -113,17 +114,16 @@ export class VSCodePoolWorker implements PoolWorker {
         reporter: new SilentReporter()
       });
 
-      await Promise.race([
-        once(this.server, 'connection'),
-        this.run.then(() => {
-          throw new Error('VS Code exited before the extension-host Vitest bridge connected.');
-        }),
-        new Promise((_, reject) => {
-          setTimeout(() => {
-            reject(new Error('Timed out waiting for the VS Code extension-host Vitest bridge to connect.'));
-          }, config.inspector.waitForDebugger ? 300_000 : 30_000).unref();
-        })
-      ]);
+      const connected = once(this.server, 'connection');
+      const timer = setTimeout(config.inspector.waitForDebugger ? 300_000 : 30_000, 'timed out', { ref: false });
+
+      const bridge = await Promise.race([connected, this.run, timer]);
+
+      if (typeof bridge === 'number' /*run exit code */)
+        throw new Error('VS Code exited before the extension-host Vitest bridge connected.');
+
+      if (bridge === 'timed out')
+        throw new Error('Timed out waiting for the VS Code extension-host Vitest bridge to connect.');
 
       this.run.catch((error) => {
         if (!this.stopping)
