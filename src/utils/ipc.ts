@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline';
 import type { Socket } from 'node:net';
 import { parse, stringify } from 'devalue';
 
-export class LineIpc extends EventEmitter {
+export class Ipc extends EventEmitter {
   constructor(private readonly socket: Socket) {
     super();
 
@@ -13,15 +13,15 @@ export class LineIpc extends EventEmitter {
     createInterface({ input: socket }).on('line', (line) => this.emit('message', parse(line)));
   }
 
-  send(message: unknown): void {
+  send(message: unknown) {
     this.socket.write(stringify(message) + '\n');
   }
 
-  close(): void {
+  close() {
     this.socket.end();
   }
 
-  destroy(): void {
+  destroy() {
     this.socket.destroy();
   }
 }

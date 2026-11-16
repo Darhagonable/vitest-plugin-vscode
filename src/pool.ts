@@ -11,7 +11,7 @@ import {
   SilentReporter,
   TestRunFailedError
 } from '@vscode/test-electron';
-import { LineIpc } from './utils/ipc';
+import { Ipc } from './utils/ipc';
 import type { PoolOptions, PoolWorker, WorkerRequest } from 'vitest/node';
 import type { VSCodeOptions } from './plugin';
 
@@ -21,7 +21,7 @@ export class VSCodePoolWorker implements PoolWorker {
   readonly name = 'vscodePool';
 
   private server: net.Server | undefined;
-  private ipc: LineIpc | undefined;
+  private ipc: Ipc | undefined;
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
@@ -87,7 +87,7 @@ export class VSCodePoolWorker implements PoolWorker {
 
     try {
       this.server = net.createServer((socket) => {
-        this.ipc = new LineIpc(socket);
+        this.ipc = new Ipc(socket);
       });
 
       await once(this.server.listen(0, '127.0.0.1'), 'listening');

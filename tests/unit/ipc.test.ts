@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as net from 'node:net';
-import { LineIpc } from '../../src/utils/ipc';
+import { Ipc } from '../../src/utils/ipc';
 
-function createSocketPair(): Promise<{ a: LineIpc; b: LineIpc; close: () => void }> {
+function createSocketPair(): Promise<{ a: Ipc; b: Ipc; close: () => void }> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.listen(0, '127.0.0.1', () => {
@@ -11,8 +11,8 @@ function createSocketPair(): Promise<{ a: LineIpc; b: LineIpc; close: () => void
       socket.on('error', reject);
       server.once('connection', connection => {
         resolve({
-          a: new LineIpc(connection),
-          b: new LineIpc(socket),
+          a: new Ipc(connection),
+          b: new Ipc(socket),
           close: () => {
             connection.destroy();
             socket.destroy();
@@ -25,7 +25,7 @@ function createSocketPair(): Promise<{ a: LineIpc; b: LineIpc; close: () => void
   });
 }
 
-describe('LineIpc', () => {
+describe('Ipc', () => {
   let pair: Awaited<ReturnType<typeof createSocketPair>>;
 
   beforeEach(async () => {

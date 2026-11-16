@@ -1,7 +1,7 @@
 import { init, runBaseTests, setupEnvironment } from 'vitest/worker';
 import { once } from 'node:events';
 import * as net from 'node:net';
-import { LineIpc } from './utils/ipc';
+import { Ipc } from './utils/ipc';
 
 export async function run() {
   const port = Number(process.env.VITEST_RUNNER_IPC_PORT);
@@ -10,7 +10,7 @@ export async function run() {
   if (!Number.isInteger(port) || port <= 0)
     throw new Error('Missing VITEST_RUNNER_IPC_PORT for Vitest VS Code bridge.');
 
-  const ipc = new LineIpc(net.connect({ host, port }));
+  const ipc = new Ipc(net.connect({ host, port }));
   await once(ipc, 'connect');
 
   init({
