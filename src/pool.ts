@@ -1,4 +1,5 @@
 import { once } from 'node:events';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import * as net from 'node:net';
@@ -24,6 +25,7 @@ export class VSCodePoolWorker implements PoolWorker {
   private run: Promise<number> | undefined;
   private profilePath: string | undefined;
   private stopping = false;
+  private dbus: ChildProcess | undefined;
 
   constructor(
     private readonly poolOptions: PoolOptions,
@@ -95,6 +97,15 @@ export class VSCodePoolWorker implements PoolWorker {
       if (!address || typeof address === 'string')
         throw new Error('Could not allocate IPC port for VS Code Vitest worker.');
 
+      // A session bus silences Chromium's connection errors where none exists.
+      let dbus: string | undefined;
+
+      if (process.platform === 'linux' && !process.env.DBUS_SESSION_BUS_ADDRESS) {
+        dbus = `/tmp/dbus-vsct-${randomUUID().slice(0, 8)}`;
+        this.dbus = spawn('dbus-daemon', ['--session', `--address=unix:path=${dbus}`], { stdio: 'ignore' });
+        this.dbus.on('error', () => {});
+      }
+
       this.run = runTests({
         vscodeExecutablePath: this.options.vscodeExecutablePath,
         version: process.env.VSCODE_VERSION ?? this.options.version,
@@ -104,6 +115,7 @@ export class VSCodePoolWorker implements PoolWorker {
         reuseMachineInstall: this.options.reuseMachineInstall,
         extensionTestsEnv: {
           ...this.options.extensionTestsEnv,
+          ...(dbus ? { DBUS_SESSION_BUS_ADDRESS: `unix:path=${dbus}` } : undefined),
           VITEST_RUNNER_IPC_HOST: '127.0.0.1',
           VITEST_RUNNER_IPC_PORT: String(address.port)
         },
@@ -155,6 +167,8 @@ export class VSCodePoolWorker implements PoolWorker {
     this.ipc = undefined;
     this.server = undefined;
     this.run = undefined;
+    this.dbus?.kill();
+    this.dbus = undefined;
     if (this.profilePath) {
       await rm(this.profilePath, { recursive: true, force: true }).catch(() => undefined);
       this.profilePath = undefined;
