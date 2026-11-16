@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [
     vscode({
       version: 'stable',
-      launchArgs: ['--log', 'off', '--disable-gpu'],
+      launchArgs: ['--log', 'off'],
     })
   ],
   test: {

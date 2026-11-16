@@ -72,6 +72,11 @@ export class VSCodePoolWorker implements PoolWorker {
         ? `--inspect-brk-extensions=${config.inspector.port ?? 9229}`
         : `--inspect-extensions=${config.inspector.port ?? 9229}`);
 
+    // On displayless Linux, VS Code needs the headless backend and
+    // disabled GPU to run cleanly.
+    if (process.platform === 'linux' && !process.env.DISPLAY)
+      launchArgs.push('--ozone-platform=headless', '--disable-gpu');
+
     if (this.options.launchArgs)
       launchArgs.push(...this.options.launchArgs);
 

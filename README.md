@@ -51,8 +51,8 @@ To customize, pass options:
 vscode({
   // pin for reproducible runs; 'stable' (default) and 'insiders' also work
   version: '1.146.0',
-  // quieter output, friendlier on headless CI
-  launchArgs: ['--log', 'off', '--disable-gpu'],
+  // quieter output: hides transient startup logs
+  launchArgs: ['--log', 'off'],
   // environment variables that reach the extension-host test process
   extensionTestsEnv: { MY_TOKEN: process.env.MY_TOKEN },
 });
@@ -126,11 +126,7 @@ jobs:
                   VSCODE_VERSION: ${{ matrix.vscode-version }}
 ```
 
-On headless Linux runners, Electron needs a D-Bus session and a display. Launch through `dbus-run-session` and `xvfb-run`:
-
-```bash
-dbus-run-session -- xvfb-run pnpm test
-```
+On headless Linux, VS Code launches with Electron's headless display backend, so `npm test` works out of the box.
 
 The first run downloads a ~350 MB VS Code build into `cachePath` (`.vscode-test` by default). Cache that directory between runs.
 
