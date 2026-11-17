@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
@@ -84,6 +85,12 @@ export class VSCodePoolWorker implements PoolWorker {
     // The spawned VS Code must start as Electron, not inherit the
     // Vitest extension's Electron-as-Node mode.
     delete process.env.ELECTRON_RUN_AS_NODE;
+
+    // One private bus per machine answers Chromium's dbus probes, reused across runs.
+    if (process.platform === 'linux' && !process.env.DBUS_SESSION_BUS_ADDRESS) {
+      spawnSync('dbus-daemon', ['--session', '--fork', '--address=unix:abstract=vitest-plugin-vscode']);
+      process.env.DBUS_SESSION_BUS_ADDRESS = 'unix:abstract=vitest-plugin-vscode';
+    }
 
     try {
       this.server = net.createServer((socket) => {
