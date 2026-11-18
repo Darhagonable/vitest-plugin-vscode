@@ -33,4 +33,4 @@ jobs:
       - run: pnpm run typecheck
 
       - name: Run tests
-        run: pnpm run test
+        run: ${{ runner.os == 'Linux' && 'dbus-run-session --' || '' }} pnpm run test

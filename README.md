@@ -128,6 +128,12 @@ jobs:
 
 On headless Linux, VS Code launches with Electron's headless display backend, so `npm test` works out of the box.
 
+Linux runners also have no session bus, so VS Code logs a few `Failed to connect to the bus` errors during startup. They are harmless and tests are unaffected. To silence them, run the tests inside a D-Bus session:
+
+```yaml
+- run: dbus-run-session -- npm test
+```
+
 The first run downloads a ~350 MB VS Code build into `cachePath` (`.vscode-test` by default). Cache that directory between runs.
 
 See the [CI workflow](.github/workflows/ci.yml) used by this repository for a complete setup.
