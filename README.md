@@ -53,8 +53,8 @@ vscode({
   version: '1.147.0',
   // run windowless and hides transient startup logs
   launchArgs: ['--hidden-window', '--log', 'off'],
-  // environment variables that reach the extension-host test process
-  extensionTestsEnv: { MY_TOKEN: process.env.MY_TOKEN },
+  // extra variables for the test process; the rest is inherited
+  extensionTestsEnv: { TEST_MODE: 'ci' },
 });
 ```
 
@@ -94,13 +94,13 @@ The `vscode()` plugin accepts these options:
 | `reuseWorker`              | `true`       | Allow Vitest to reuse the extension-host worker across test files (effective with vitest's `isolate: false`).                                                                                               |
 | `vscodeExecutablePath`     | `undefined`  | Path to a VS Code executable to use for testing. If not specified, VS Code will be downloaded based on `version`.                                                                                           |
 | `reuseMachineInstall`      | `false`      | Whether VS Code should be launched using default settings and extensions installed on this machine. If `false`, then separate directories will be used inside the `.vscode-test` folder within the project. |
-| `extensionDevelopmentPath` | project root | The extension root loaded into the development host. Point Vitest's `root` at your extension directory, or pass an explicit path.                                                                           |
+| `extensionDevelopmentPath` | project root | The extension root loaded into the development host. Point Vitest's `root` at your extension directory, or pass an explicit path. An array loads several extensions.                                                                           |
 | `launchArgs`               | `[]`         | Additional arguments passed to the VS Code executable. See [`code --help`](https://code.visualstudio.com/docs/configure/command-line) for available options.                                                |
-| `extensionTestsEnv`        | `undefined`  | Custom environment variables merged into the extension-host test process.                                                                       |
+| `extensionTestsEnv`        | `undefined`  | Custom variables passed to the extension host; `process.env` is inherited.                                                                       |
 | `platform`                 | (auto)       | VS Code platform to download: `'darwin'`, `'darwin-arm64'`, `'win32-x64-archive'`, `'win32-arm64-archive'`, `'linux-x64'`, `'linux-arm64'`, `'linux-armhf'`                                                 |
 | `cachePath`                | (auto)       | Directory where downloaded VS Code instances are cached. Defaults to `.vscode-test` in your project.                                                                                                        |
 
-All remaining `@vscode/test-electron` options (`timeout`, `reporter`, `extractSync`, `stdout`, `stderr`) are passed through. See [their `TestOptions`](https://github.com/microsoft/vscode-test/blob/main/lib/runTest.ts).
+All remaining `@vscode/test-electron` options are passed through: `stdout` and `stderr` (child process streams), `extractSync`, `timeout` (download idle timeout), and `reporter` (download progress). The last two concern downloading VS Code, not tests. See [their `TestOptions`](https://github.com/microsoft/vscode-test/blob/main/lib/runTest.ts).
 
 - **Pin a specific VS Code version:** Set `version: '1.147.0'` for reproducible CI builds
 - **Use your local VS Code:** Set `vscodeExecutablePath: '/Applications/Visual Studio Code.app/Contents/MacOS/Electron'` to test against your installed copy

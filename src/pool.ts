@@ -81,10 +81,6 @@ export class VSCodePoolWorker implements PoolWorker {
     if (this.options.launchArgs)
       launchArgs.push(...this.options.launchArgs);
 
-    // The spawned VS Code must start as Electron, not inherit the
-    // Vitest extension's Electron-as-Node mode.
-    delete process.env.ELECTRON_RUN_AS_NODE;
-
     try {
       this.server = net.createServer((socket) => {
         this.ipc = new Ipc(socket);
@@ -105,6 +101,8 @@ export class VSCodePoolWorker implements PoolWorker {
         reuseMachineInstall: this.options.reuseMachineInstall,
         extensionTestsEnv: {
           ...this.options.extensionTestsEnv,
+          // the extension host sets this; VS Code must boot as Electron, not Node
+          ELECTRON_RUN_AS_NODE: undefined,
           VITEST_RUNNER_IPC_HOST: '127.0.0.1',
           VITEST_RUNNER_IPC_PORT: String(address.port)
         },
