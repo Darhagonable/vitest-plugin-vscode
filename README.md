@@ -50,9 +50,9 @@ To customize, pass options:
 ```ts
 vscode({
   // pin for reproducible runs; 'stable' (default) and 'insiders' also work
-  version: '1.146.0',
-  // quieter output: hides transient startup logs
-  launchArgs: ['--log', 'off'],
+  version: '1.147.0',
+  // run windowless and hides transient startup logs
+  launchArgs: ['--hidden-window', '--log', 'off'],
   // environment variables that reach the extension-host test process
   extensionTestsEnv: { MY_TOKEN: process.env.MY_TOKEN },
 });
@@ -90,7 +90,7 @@ The `vscode()` plugin accepts these options:
 
 | Option                     | Default      | Description                                                                                                                                                                                                 |
 | -------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`                  | `'stable'`   | VS Code build to download: `'stable'`, `'insiders'`, or a specific version tag like `'1.146.0'`. Overridden by `VSCODE_VERSION` environment variable if set.                                               |
+| `version`                  | `'stable'`   | VS Code build to download: `'stable'`, `'insiders'`, or a specific version tag like `'1.147.0'`. Overridden by `VSCODE_VERSION` environment variable if set.                                               |
 | `reuseWorker`              | `true`       | Allow Vitest to reuse the extension-host worker across test files (effective with vitest's `isolate: false`).                                                                                               |
 | `vscodeExecutablePath`     | `undefined`  | Path to a VS Code executable to use for testing. If not specified, VS Code will be downloaded based on `version`.                                                                                           |
 | `reuseMachineInstall`      | `false`      | Whether VS Code should be launched using default settings and extensions installed on this machine. If `false`, then separate directories will be used inside the `.vscode-test` folder within the project. |
@@ -102,11 +102,11 @@ The `vscode()` plugin accepts these options:
 
 All remaining `@vscode/test-electron` options (`timeout`, `reporter`, `extractSync`, `stdout`, `stderr`) are passed through. See [their `TestOptions`](https://github.com/microsoft/vscode-test/blob/main/lib/runTest.ts).
 
-- **Pin a specific VS Code version:** Set `version: '1.146.0'` for reproducible CI builds
+- **Pin a specific VS Code version:** Set `version: '1.147.0'` for reproducible CI builds
 - **Use your local VS Code:** Set `vscodeExecutablePath: '/Applications/Visual Studio Code.app/Contents/MacOS/Electron'` to test against your installed copy
 - **Test with specific settings:** Use `reuseMachineInstall: true` to test with your actual VS Code configuration
 - **Add workspace folders:** Include `launchArgs: ['path/to/workspace']` to open a specific workspace when testing
-- **Run windowless:** `launchArgs: ['--hidden-window']` keeps the test VS Code entirely off-screen. No window, no focus stealing on macOS. Requires VS Code Insiders (or stable 1.147+); `vscode.window.state.focused` reports `false` while it's on
+- **Run windowless:** `launchArgs: ['--hidden-window']` keeps the test VS Code entirely off-screen. No window, no focus stealing on macOS. Requires VS Code 1.147+; `vscode.window.state.focused` reports `false` while it's on
 
 ## Running in CI
 

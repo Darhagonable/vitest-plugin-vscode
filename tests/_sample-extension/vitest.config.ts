@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [
     vscode({
       version: 'stable',
-      launchArgs: ['--log', 'off'],
+      launchArgs: ['--hidden-window', '--log', 'off'],
     })
   ],
   test: {
